@@ -27,6 +27,8 @@ interface NormalizedEvent {
   message_text: string | null;
   /** 'text' | 'image' | 'video' | 'audio' | 'story_mention' | 'unsupported' */
   message_type: string;
+  /** Attachment metadata exactly as provided by Meta (type + payload URL). */
+  attachments: Array<Record<string, unknown>>;
   /** Any available profile data from the payload */
   profile_data: Record<string, unknown>;
   /** Full raw payload preserved for debugging / future use */
@@ -52,32 +54,66 @@ function parseInstagramEvent(entry: Record<string, unknown>): NormalizedEvent[] 
   const recipientId = (entry['id'] as string) ?? '';
 
   for (const msg of messaging) {
-    const sender = msg['sender'] as Record<string, unknown> | undefined;
     const message = msg['message'] as Record<string, unknown> | undefined;
     const timestampMs = (msg['timestamp'] as number) ?? Date.now();
 
-    if (!sender || !message) continue;
+    // ---- EVENT_TYPE classification ------------------------------------
+    // Only real inbound `message` events become chat messages. Seen
+    // receipts, deliveries, reactions, echoes, optins, referrals and
+    // postbacks are logged and SKIPPED — never stored as text messages.
+    if (!message || message['is_echo'] === true) {
+      const eventType = message?.['is_echo'] === true
+        ? 'echo'
+        : msg['read']
+        ? 'message_seen'
+        : msg['delivery']
+        ? 'message_delivered'
+        : msg['reaction']
+        ? 'message_reactions'
+        : msg['optin']
+        ? 'optin'
+        : msg['referral']
+        ? 'referral'
+        : msg['postback']
+        ? 'postback'
+        : 'unknown_non_message';
+      console.log(`EVENT_TYPE: ${eventType} (skipped — not an inbound chat message)`);
+      continue;
+    }
+
+    const sender = msg['sender'] as Record<string, unknown> | undefined;
+    if (!sender) {
+      console.log('EVENT_TYPE: message_without_sender (skipped)');
+      continue;
+    }
 
     const senderId = (sender['id'] as string) ?? '';
     const messageId = (message['mid'] as string) ?? '';
-
-    // Skip echo events (messages sent by the page itself)
-    if (message['is_echo'] === true) {
-      console.log('[bright-worker] Skipping echo message:', messageId);
+    if (!messageId) {
+      // external_message_id powers idempotency; without it we cannot dedupe.
+      console.log('EVENT_TYPE: message_without_mid (skipped)');
       continue;
     }
 
     // Determine message type and content
     let messageText: string | null = null;
     let messageType = 'unsupported';
+    const attachments: Array<Record<string, unknown>> = [];
 
     if (typeof message['text'] === 'string') {
       messageText = message['text'];
       messageType = 'text';
-    } else if (message['attachments']) {
-      const attachments = message['attachments'] as Record<string, unknown>[];
-      const firstAttachment = attachments[0];
-      messageType = (firstAttachment?.['type'] as string) ?? 'unsupported';
+    } else if (Array.isArray(message['attachments'])) {
+      // Store ONLY the metadata Meta provides (type + payload URL).
+      // No AI analysis, no content inference (Phase 1).
+      for (const att of message['attachments'] as Record<string, unknown>[]) {
+        const payload = att['payload'] as Record<string, unknown> | undefined;
+        attachments.push({
+          type: (att['type'] as string) ?? null,
+          url: (payload?.['url'] as string) ?? null,
+        });
+      }
+      messageType = (attachments[0]?.['type'] as string) ?? 'unsupported';
     } else if (message['story_mention']) {
       messageType = 'story_mention';
     }
@@ -90,6 +126,7 @@ function parseInstagramEvent(entry: Record<string, unknown>): NormalizedEvent[] 
       external_message_id: messageId,
       message_text: messageText,
       message_type: messageType,
+      attachments,
       profile_data: {}, // No profile data available in the webhook payload
       raw_data: msg,
       timestamp_ms: timestampMs,
@@ -116,31 +153,60 @@ function parseFacebookEvent(entry: Record<string, unknown>): NormalizedEvent[] {
   const recipientId = (entry['id'] as string) ?? '';
 
   for (const msg of messaging) {
-    const sender = msg['sender'] as Record<string, unknown> | undefined;
     const message = msg['message'] as Record<string, unknown> | undefined;
     const timestampMs = (msg['timestamp'] as number) ?? Date.now();
 
-    if (!sender || !message) continue;
+    // Same EVENT_TYPE classification as Instagram: only inbound `message`
+    // events are persisted; receipts/reactions/echoes are skipped.
+    if (!message || message['is_echo'] === true) {
+      const eventType = message?.['is_echo'] === true
+        ? 'echo'
+        : msg['read']
+        ? 'message_seen'
+        : msg['delivery']
+        ? 'message_delivered'
+        : msg['reaction']
+        ? 'message_reactions'
+        : msg['optin']
+        ? 'optin'
+        : msg['referral']
+        ? 'referral'
+        : msg['postback']
+        ? 'postback'
+        : 'unknown_non_message';
+      console.log(`EVENT_TYPE: ${eventType} (skipped — not an inbound chat message)`);
+      continue;
+    }
+
+    const sender = msg['sender'] as Record<string, unknown> | undefined;
+    if (!sender) {
+      console.log('EVENT_TYPE: message_without_sender (skipped)');
+      continue;
+    }
 
     const senderId = (sender['id'] as string) ?? '';
     const messageId = (message['mid'] as string) ?? '';
-
-    // Skip echo events
-    if (message['is_echo'] === true) {
-      console.log('[bright-worker] Skipping Facebook echo message:', messageId);
+    if (!messageId) {
+      console.log('EVENT_TYPE: message_without_mid (skipped)');
       continue;
     }
 
     let messageText: string | null = null;
     let messageType = 'unsupported';
+    const attachments: Array<Record<string, unknown>> = [];
 
     if (typeof message['text'] === 'string') {
       messageText = message['text'];
       messageType = 'text';
-    } else if (message['attachments']) {
-      const attachments = message['attachments'] as Record<string, unknown>[];
-      const firstAttachment = attachments[0];
-      messageType = (firstAttachment?.['type'] as string) ?? 'unsupported';
+    } else if (Array.isArray(message['attachments'])) {
+      for (const att of message['attachments'] as Record<string, unknown>[]) {
+        const payload = att['payload'] as Record<string, unknown> | undefined;
+        attachments.push({
+          type: (att['type'] as string) ?? null,
+          url: (payload?.['url'] as string) ?? null,
+        });
+      }
+      messageType = (attachments[0]?.['type'] as string) ?? 'unsupported';
     }
 
     events.push({
@@ -151,6 +217,7 @@ function parseFacebookEvent(entry: Record<string, unknown>): NormalizedEvent[] {
       external_message_id: messageId,
       message_text: messageText,
       message_type: messageType,
+      attachments,
       profile_data: {},
       raw_data: msg,
       timestamp_ms: timestampMs,
@@ -166,17 +233,31 @@ function parseFacebookEvent(entry: Record<string, unknown>): NormalizedEvent[] {
 // Messages are inserted once per external_message_id.
 // ---------------------------------------------------------------------------
 
+/**
+ * Detect which optional messaging columns actually exist on `messages`
+ * (channel / direction / attachments) so the insert row adapts to the
+ * migration state instead of failing on a missing column.
+ */
+async function getMessageColumns(
+  supabase: ReturnType<typeof createClient>,
+): Promise<Set<string>> {
+  const candidates = ['channel', 'direction', 'attachments'];
+  const existing = new Set<string>();
+  for (const col of candidates) {
+    const { error } = await supabase.from('messages').select(col).limit(0);
+    if (!error) existing.add(col);
+  }
+  return existing;
+}
+
 async function persistEvent(
   supabase: ReturnType<typeof createClient>,
   event: NormalizedEvent,
   organizationId: string,
 ) {
-  console.log(`[bright-worker] Persisting ${event.channel} event:`, {
-    social_account_external_id: event.social_account_external_id,
-    external_user_id: event.external_user_id,
-    external_message_id: event.external_message_id,
-    message_type: event.message_type,
-  });
+  console.log(
+    `EVENT_TYPE: ${event.channel}:${event.message_type} mid=${event.external_message_id} sender=${event.external_user_id}`,
+  );
 
   // 1. Find the social_account by external_account_id + channel
   const { data: socialAccount, error: saError } = await supabase
@@ -209,6 +290,9 @@ async function persistEvent(
     return;
   }
 
+  console.log(
+    `SOCIAL_ACCOUNT_FOUND: ${socialAccount.id} organization=${socialAccount.organization_id}`,
+  );
   const resolvedOrgId = socialAccount.organization_id;
   const socialAccountId = socialAccount.id;
 
@@ -229,7 +313,7 @@ async function persistEvent(
 
   if (existingChannel) {
     contactChannelId = existingChannel.id;
-    console.log('[bright-worker] Found existing contact_channel:', contactChannelId);
+    console.log(`CONTACT_FOUND_OR_CREATED: found contact_channel=${contactChannelId}`);
   } else {
     // Create a contact first, then a contact_channel record
     const { data: newContact, error: contactError } = await supabase
@@ -265,7 +349,7 @@ async function persistEvent(
     }
 
     contactChannelId = newChannel.id;
-    console.log('[bright-worker] Created new contact + channel:', newContact.id, contactChannelId);
+    console.log(`CONTACT_FOUND_OR_CREATED: created contact=${newContact.id} contact_channel=${contactChannelId} name="${newContact.name ?? ''}"`);
   }
 
   // Get the contact_id from the channel record for the conversation
@@ -299,6 +383,7 @@ async function persistEvent(
       .from('conversations')
       .update({ last_message_at: new Date(event.timestamp_ms).toISOString() })
       .eq('id', conversationId);
+    console.log(`CONVERSATION_FOUND_OR_CREATED: found conversation=${conversationId}`);
   } else {
     const { data: newConv, error: newConvError } = await supabase
       .from('conversations')
@@ -320,32 +405,44 @@ async function persistEvent(
     }
 
     conversationId = newConv.id;
-    console.log('[bright-worker] Created new conversation:', conversationId);
+    console.log(`CONVERSATION_FOUND_OR_CREATED: created conversation=${conversationId}`);
   }
 
-  // 4. Insert message (idempotent via external_message_id uniqueness)
+  // 4. Insert message (idempotent via external_message_id uniqueness).
+  // Optional columns (channel / direction / attachments) are written only
+  // when they exist, so the worker works before AND after the migration.
+  const msgColumns = await getMessageColumns(supabase);
+  const messageRow: Record<string, unknown> = {
+    organization_id: resolvedOrgId,
+    conversation_id: conversationId,
+    external_message_id: event.external_message_id,
+    sender_external_id: event.external_user_id,
+    message_text: event.message_text,
+    message_type: event.message_type,
+    raw_data: event.raw_data,
+    created_at: new Date(event.timestamp_ms).toISOString(),
+  };
+  if (msgColumns.has('channel')) messageRow.channel = event.channel;
+  if (msgColumns.has('direction')) messageRow.direction = 'inbound';
+  if (msgColumns.has('attachments') && event.attachments.length > 0) {
+    messageRow.attachments = event.attachments;
+  }
+
   const { error: msgError } = await supabase
     .from('messages')
-    .insert({
-      organization_id: resolvedOrgId,
-      conversation_id: conversationId,
-      external_message_id: event.external_message_id,
-      sender_external_id: event.external_user_id,
-      message_text: event.message_text,
-      message_type: event.message_type,
-      raw_data: event.raw_data,
-      created_at: new Date(event.timestamp_ms).toISOString(),
-    });
+    .insert(messageRow);
 
   if (msgError) {
     // Unique constraint violation = duplicate delivery, safe to ignore
     if (msgError.code === '23505') {
-      console.log('[bright-worker] Duplicate message skipped:', event.external_message_id);
+      console.log(`MESSAGE_DUPLICATE_SKIPPED: ${event.external_message_id}`);
     } else {
       console.error('[bright-worker] Error inserting message:', msgError.message);
     }
     return;
   }
+
+  console.log(`MESSAGE_SAVED: ${event.external_message_id} conversation=${conversationId}`);
 
   // 5. Store raw webhook event
   await supabase.from('raw_webhook_events').insert({
@@ -388,40 +485,80 @@ Deno.serve(async (req: Request) => {
   // POST: Incoming Meta event
   // ------------------------------------------------------------------
   if (req.method === 'POST') {
-    // Always return 200 quickly to Meta; process asynchronously
-    // (We process synchronously here for MVP; for production use a queue)
+    const rawBody = await req.text();
+
+    // Optional webhook signature verification (X-Hub-Signature-256).
+    // Enabled ONLY when META_WEBHOOK_SECRET is set (should equal the App
+    // Secret of the subscribed Meta app). The secret is never logged.
+    const webhookSecret = Deno.env.get('META_WEBHOOK_SECRET') ?? '';
+    if (webhookSecret) {
+      const signature = req.headers.get('x-hub-signature-256') ?? '';
+      const key = await crypto.subtle.importKey(
+        'raw',
+        new TextEncoder().encode(webhookSecret),
+        { name: 'HMAC', hash: 'SHA-256' },
+        false,
+        ['sign'],
+      );
+      const mac = await crypto.subtle.sign(
+        'HMAC',
+        key,
+        new TextEncoder().encode(rawBody),
+      );
+      const expected =
+        'sha256=' +
+        Array.from(new Uint8Array(mac))
+          .map((b) => b.toString(16).padStart(2, '0'))
+          .join('');
+      if (signature !== expected) {
+        console.warn('WEBHOOK_SIGNATURE: MISMATCH — request rejected');
+        return new Response('Invalid signature', { status: 401 });
+      }
+      console.log('WEBHOOK_SIGNATURE: OK');
+    } else {
+      console.warn(
+        'WEBHOOK_SIGNATURE: DISABLED — set META_WEBHOOK_SECRET to verify X-Hub-Signature-256',
+      );
+    }
 
     let body: Record<string, unknown>;
     try {
-      body = await req.json();
+      body = JSON.parse(rawBody);
     } catch {
-      console.error('[bright-worker] Failed to parse JSON body');
+      console.error('WEBHOOK_RECEIVED: invalid JSON body');
       return new Response('Bad Request', { status: 400 });
     }
 
-    console.log('[bright-worker] Received POST event, object type:', body['object']);
+    const objectType = (body['object'] as string) ?? 'unknown';
+    const entries = body['entry'] as Record<string, unknown>[] | undefined;
+    console.log(
+      `WEBHOOK_RECEIVED: object=${objectType} entries=${Array.isArray(entries) ? entries.length : 0}`,
+    );
+
+    if (!Array.isArray(entries)) {
+      console.warn('EVENT_TYPE: no_entry_array (nothing to process)');
+      return new Response('OK', { status: 200 });
+    }
 
     // Initialize Supabase with the service role key (server-side only, never exposed to browser)
     const supabaseUrl = Deno.env.get('SUPABASE_URL') ?? '';
     const supabaseServiceKey = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY') ?? '';
     const supabase = createClient(supabaseUrl, supabaseServiceKey);
 
-    // For MVP: use a default organization_id derived from a Supabase secret
-    // In production, this will be resolved from the social_account → organization mapping
+    // Fallback org ONLY for raw webhook events that cannot be attributed to
+    // any connected social account. Real attribution always comes from
+    // social_accounts.organization_id (multi-tenant, never hardcoded).
     const defaultOrgId = Deno.env.get('DEFAULT_ORGANIZATION_ID') ?? '';
 
-    const objectType = body['object'] as string;
-    const entries = body['entry'] as Record<string, unknown>[] | undefined;
-
-    if (!Array.isArray(entries)) {
-      console.warn('[bright-worker] No entries in payload');
-      return new Response('OK', { status: 200 });
-    }
-
-    // Detect platform and parse events
+    // Parse and queue persistence work. Respond 200 to Meta FIRST, then
+    // finish persistence in the background (EdgeRuntime.waitUntil) so we
+    // never delay the response with long processing.
+    const persistence: Promise<void>[] = [];
     for (const entry of entries) {
       if (objectType !== 'instagram' && objectType !== 'page') {
-        console.warn('[bright-worker] Unknown object type:', objectType);
+        console.log(
+          `EVENT_TYPE: unsupported_object:${objectType} (skipped — not a messaging event, nothing stored as a message)`,
+        );
         continue;
       }
 
@@ -431,7 +568,19 @@ Deno.serve(async (req: Request) => {
           : parseFacebookEvent(entry);
 
       for (const event of normalizedEvents) {
-        await persistEvent(supabase, event, defaultOrgId);
+        persistence.push(persistEvent(supabase, event, defaultOrgId));
+      }
+    }
+
+    if (persistence.length > 0) {
+      const all = Promise.all(persistence);
+      const edgeRuntime = (
+        globalThis as { EdgeRuntime?: { waitUntil?: (p: Promise<unknown>) => void } }
+      ).EdgeRuntime;
+      if (edgeRuntime?.waitUntil) {
+        edgeRuntime.waitUntil(all);
+      } else {
+        await all;
       }
     }
 

@@ -62,13 +62,41 @@ export interface Message {
   created_at: string;
 }
 
+export interface Contact {
+  id: string;
+  organization_id: string;
+  name: string;
+  created_at: string;
+}
+
 export interface Conversation {
   id: string;
   organization_id: string;
-  customer_id?: string;
-  platform: 'instagram' | 'facebook' | 'whatsapp';
+  social_account_id: string;
+  contact_id: string;
+  channel: 'instagram' | 'facebook' | 'whatsapp';
+  external_conversation_id: string | null;
   status: 'open' | 'closed' | 'snoozed';
-  last_message_at: string;
+  last_message_at: string | null;
+  created_at: string;
+  /** Joined data (not columns of the table itself). */
+  contact?: { id: string; name: string } | null;
   messages?: Message[];
+}
+
+export interface Message {
+  id: string;
+  organization_id: string;
+  conversation_id: string;
+  /** Meta message id — used for idempotency (one row per Meta delivery). */
+  external_message_id: string;
+  /** The external user id of the sender (IGSID for inbound DMs). */
+  sender_external_id: string;
+  /** 'text' | 'image' | 'video' | 'audio' | 'story_mention' | 'unsupported' */
+  message_type: string;
+  message_text: string | null;
+  /** Full raw webhook payload, preserved for debugging / future phases. */
+  raw_data?: unknown;
+  created_at: string;
 }
 
