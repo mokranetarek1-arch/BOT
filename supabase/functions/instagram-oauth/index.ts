@@ -47,8 +47,13 @@ function getConfig(): OAuthConfig {
 
   const appId = Deno.env.get('INSTAGRAM_APP_ID') ?? '';
   const appSecret = Deno.env.get('INSTAGRAM_APP_SECRET') ?? '';
+  // Scopes EXACTLY as issued by Meta for this app's authorization URL:
+  //   instagram_business_basic, instagram_business_manage_messages,
+  //   instagram_business_manage_comments, instagram_business_content_publish,
+  //   instagram_business_manage_insights
+  // Can be overridden via the INSTAGRAM_SCOPES secret (comma-separated).
   const scopes = (Deno.env.get('INSTAGRAM_SCOPES') ??
-    'instagram_business_basic')
+    'instagram_business_basic,instagram_business_manage_messages,instagram_business_manage_comments,instagram_business_content_publish,instagram_business_manage_insights')
     .split(',')
     .map((s) => s.trim())
     .filter(Boolean);
@@ -460,6 +465,11 @@ Deno.serve(async (req: Request) => {
     authorizeUrl.searchParams.set('redirect_uri', redirectUri);
     authorizeUrl.searchParams.set('response_type', 'code');
     authorizeUrl.searchParams.set('scope', cfg.scopes.join(','));
+    // force_reauth=true — present in the authorization URL issued by Meta.
+    // (Instagram Login dialog parameter; not applied in facebook mode.)
+    if (cfg.mode === 'instagram') {
+      authorizeUrl.searchParams.set('force_reauth', 'true');
+    }
     // A random state; the frontend stores the same value and compares on return.
     authorizeUrl.searchParams.set(
       'state',
