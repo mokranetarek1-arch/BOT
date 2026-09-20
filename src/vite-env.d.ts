@@ -1,0 +1,14 @@
+/// <reference types="vite/client" />
+
+// Explicit typing for our public Vite env vars (see .env / .env.example).
+// These are PUBLIC values only — never add secrets (App Secret, tokens) here.
+interface ImportMetaEnv {
+  readonly VITE_SUPABASE_URL: string;
+  readonly VITE_SUPABASE_PUBLISHABLE_KEY: string;
+  /** Must exactly match the OAuth redirect URI registered in the Meta dashboard. */
+  readonly VITE_INSTAGRAM_REDIRECT_URI: string;
+}
+
+interface ImportMeta {
+  readonly env: ImportMetaEnv;
+}
