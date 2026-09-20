@@ -32,6 +32,14 @@ export default function InstagramCallback() {
     setSearchParams(next, { replace: true });
   }, [setSearchParams]);
 
+  // On successful connection, return to Settings automatically (the connected
+  // state is shown there). Errors remain on this page with a visible message
+  // and the "Back to Settings" button. `replace` keeps the callback URL (whose
+  // code/state are already cleaned) out of the history.
+  const handleConnected = useCallback(() => {
+    window.setTimeout(() => navigate('/settings', { replace: true }), 1200);
+  }, [navigate]);
+
   return (
     <div className="p-6 max-w-2xl">
       <Card>
@@ -48,6 +56,7 @@ export default function InstagramCallback() {
               code={initialCode}
               state={initialState}
               onCallbackHandled={handleDone}
+              onConnected={handleConnected}
             />
           )}
 

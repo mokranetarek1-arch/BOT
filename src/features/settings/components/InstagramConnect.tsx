@@ -15,6 +15,8 @@ interface InstagramConnectProps {
   state?: string | null;
   /** Called once the callback is handled so the parent can clean the URL. */
   onCallbackHandled?: () => void;
+  /** Called once the OAuth callback completed SUCCESSFULLY (account saved). */
+  onConnected?: () => void;
 }
 
 /**
@@ -25,8 +27,10 @@ export default function InstagramConnect({
   code,
   state,
   onCallbackHandled,
+  onConnected,
 }: InstagramConnectProps) {
   const [account, setAccount] = useState<SocialAccount | null>(null);
+  const [disconnecting, setDisconnecting] = useState(false);
   const [phase, setPhase] = useState<Phase>(code ? 'callback' : 'idle');
   const [message, setMessage] = useState<string | null>(
     code ? 'Finishing Instagram connection…' : null,
@@ -43,6 +47,11 @@ export default function InstagramConnect({
   const onCallbackHandledRef = useRef(onCallbackHandled);
   useEffect(() => {
     onCallbackHandledRef.current = onCallbackHandled;
+  });
+
+  const onConnectedRef = useRef(onConnected);
+  useEffect(() => {
+    onConnectedRef.current = onConnected;
   });
 
   // Handle the OAuth redirect back (?code=...&state=...) and load existing state.
@@ -81,6 +90,8 @@ export default function InstagramConnect({
               ? `Connected${existing.account_name ? ` as @${existing.account_name}` : ''}.`
               : 'This authorization code was already used. Please start a new connection.',
           );
+          // Refresh-on-callback after a success: return to Settings as well.
+          if (existing) onConnectedRef.current?.();
         })
         .catch(() => {
           if (!cancelled) {
@@ -105,6 +116,8 @@ export default function InstagramConnect({
             ? `Connected @${result.account?.username ?? ''}. Note: ${result.warning}`
             : `Connected @${result.account?.username ?? 'Instagram account'}.`,
         );
+        // Account saved — let the parent send the user back to Settings.
+        onConnectedRef.current?.();
       })
       .catch((err: unknown) => {
         if (cancelled) return;
@@ -141,6 +154,28 @@ export default function InstagramConnect({
     }
   };
 
+  const handleDisconnect = async () => {
+    if (!account) return;
+    setDisconnecting(true);
+    setMessage(null);
+    try {
+      await instagramService.disconnect(account.id);
+      // Re-fetch to reflect the truth (the delete may be blocked by RLS).
+      const existing = await instagramService.getConnectedAccount();
+      setAccount(existing);
+      setPhase(existing ? 'done' : 'idle');
+      setMessage(
+        existing
+          ? 'Could not disconnect — the database blocked the deletion (missing DELETE policy on social_accounts).'
+          : 'Instagram disconnected.',
+      );
+    } catch (err) {
+      setMessage(err instanceof Error ? err.message : 'Could not disconnect.');
+    } finally {
+      setDisconnecting(false);
+    }
+  };
+
   const isConnected = !!account;
 
   return (
@@ -152,24 +187,44 @@ export default function InstagramConnect({
           </div>
           <div>
             <p className="font-medium">Instagram</p>
-            <p className="text-sm text-muted-foreground">
-              {isConnected
-                ? `Connected${account?.account_name ? ` as @${account.account_name}` : ''}`
-                : 'Not connected'}
+            <p className="text-sm text-muted-foreground flex items-center gap-1.5">
+              {isConnected ? (
+                <>
+                  <span
+                    className="inline-block w-2 h-2 rounded-full bg-green-500"
+                    aria-hidden="true"
+                  />
+                  Connected{account?.account_name ? ` — @${account.account_name}` : ''}
+                </>
+              ) : (
+                'Not connected'
+              )}
             </p>
           </div>
         </div>
-        <Button
-          variant={isConnected ? 'outline' : 'default'}
-          onClick={handleConnect}
-          disabled={phase === 'connecting' || showCallback}
-        >
-          {phase === 'connecting'
-            ? 'Redirecting…'
-            : isConnected
-              ? 'Reconnect Instagram'
-              : 'Connect Instagram'}
-        </Button>
+        <div className="flex items-center gap-2">
+          {isConnected && (
+            <Button
+              variant="outline"
+              onClick={handleDisconnect}
+              disabled={disconnecting || phase === 'connecting' || showCallback}
+              className="text-destructive hover:text-destructive"
+            >
+              {disconnecting ? 'Disconnecting…' : 'Disconnect'}
+            </Button>
+          )}
+          <Button
+            variant={isConnected ? 'outline' : 'default'}
+            onClick={handleConnect}
+            disabled={phase === 'connecting' || showCallback || disconnecting}
+          >
+            {phase === 'connecting'
+              ? 'Redirecting…'
+              : isConnected
+                ? 'Reconnect Instagram'
+                : 'Connect Instagram'}
+          </Button>
+        </div>
       </div>
 
       {message && (

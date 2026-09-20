@@ -187,4 +187,18 @@ export const instagramService = {
     if (error) throw new Error(error.message);
     return (data as SocialAccount) ?? null;
   },
+
+  /**
+   * Delete the connected Instagram account row (and its stored token).
+   * Row scoping relies on the same RLS that scopes reads; callers should
+   * re-fetch the account afterwards to confirm the deletion actually happened.
+   */
+  async disconnect(accountId: string): Promise<void> {
+    const { error } = await supabase
+      .from('social_accounts')
+      .delete()
+      .eq('id', accountId)
+      .eq('platform', 'instagram');
+    if (error) throw new Error(error.message);
+  },
 };
