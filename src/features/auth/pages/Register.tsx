@@ -69,14 +69,34 @@ export default function Register() {
     
     setLoading(true);
     try {
-      // 1. Create Supabase Auth User
+      // 1. Create Supabase Auth User.
+      // Names/company go into user_metadata so server-side code (e.g. the
+      // instagram-oauth Edge Function's onboarding repair) can reuse them.
       const { data: authData, error: authError } = await supabase.auth.signUp({
         email: formData.email,
         password: formData.password,
+        options: {
+          data: {
+            first_name: formData.firstName,
+            last_name: formData.lastName,
+            company_name: formData.companyName,
+          },
+        },
       });
 
       if (authError) throw authError;
-      
+
+      // Email confirmation enabled: there is no session yet, so the
+      // RLS-protected inserts below would fail and leave a half-onboarded
+      // account (auth user without organization membership). Ask the user
+      // to confirm their email first instead.
+      if (!authData.session) {
+        setError(
+          'Account created. Please confirm your email address, then sign in to finish setting up your organization.'
+        );
+        return;
+      }
+
       const userId = authData.user?.id;
       if (!userId) throw new Error('Failed to retrieve user ID after registration.');
 
@@ -88,23 +108,31 @@ export default function Register() {
         phone: formData.phone || null,
       });
 
-      if (profileError) throw profileError;
+      if (profileError) {
+        throw new Error(`Profile creation failed: ${profileError.message}`);
+      }
 
       // 3. Create Organization
       const { data: orgData, error: orgError } = await supabase.from('organizations').insert({
         name: formData.companyName,
       }).select().single();
 
-      if (orgError) throw orgError;
+      if (orgError) {
+        throw new Error(`Organization creation failed: ${orgError.message}`);
+      }
 
       // 4. Create Organization Membership
+      // (This row is what the instagram-oauth Edge Function uses to resolve
+      // the tenant — never a profiles.organization_id column.)
       const { error: memberError } = await supabase.from('organization_members').insert({
         organization_id: orgData.id,
         user_id: userId,
         role: 'owner',
       });
 
-      if (memberError) throw memberError;
+      if (memberError) {
+        throw new Error(`Organization membership failed: ${memberError.message}`);
+      }
 
       // Registration successful, navigate to dashboard
       navigate('/dashboard');

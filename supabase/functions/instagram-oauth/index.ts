@@ -283,16 +283,79 @@ async function fetchProfile(
 // A user may belong to several organizations; OAuth has no org picker, so we
 // deterministically pick the first membership (ordered by organization_id for
 // stability). Extend this later if you add multi-org switching.
+//
+// ONBOARDING REPAIR: accounts created before Register.tsx gained its
+// organization step — or whose signup partially failed (e.g. RLS rejected the
+// inserts) — have NO `organization_members` row at all, which used to fail
+// OAuth with "No organization_id found for this user". For those accounts we
+// create the missing organization + owner membership here, using the SAME
+// existing tables as Register.tsx. The new org belongs exclusively to the
+// JWT-verified caller: never another user's org, never a hardcoded id, never
+// taken from the client.
 // ---------------------------------------------------------------------------
+
+interface AuthUserLike {
+  id: string;
+  email?: string;
+  user_metadata?: Record<string, unknown>;
+}
+
+/**
+ * Create the organization + owner membership this user is missing.
+ * Mirrors Register.tsx steps 3 and 4 exactly (same tables, same shape).
+ * Runs with the service-role client on the server; the user id always comes
+ * from the verified JWT, never from the request body.
+ */
+async function ensureOrganizationForUser(
+  admin: ReturnType<typeof createClient>,
+  user: AuthUserLike,
+): Promise<string> {
+  const metaName = user.user_metadata?.['company_name'];
+  const orgName =
+    typeof metaName === 'string' && metaName.trim().length > 0
+      ? metaName.trim()
+      : 'My Organization';
+
+  // 1. Create the organization (Register.tsx step 3).
+  const { data: org, error: orgError } = await admin
+    .from('organizations')
+    .insert({ name: orgName })
+    .select('id')
+    .single();
+  if (orgError || !org) {
+    throw new Error(
+      `Onboarding repair failed — could not create organization: ${orgError?.message ?? 'unknown error'}`,
+    );
+  }
+
+  // 2. Make this user its owner (Register.tsx step 4).
+  const { error: memberError } = await admin
+    .from('organization_members')
+    .insert({
+      organization_id: org.id,
+      user_id: user.id,
+      role: 'owner',
+    });
+  if (memberError) {
+    throw new Error(
+      `Onboarding repair failed — could not create organization membership: ${memberError.message}`,
+    );
+  }
+
+  console.log(
+    `[instagram-oauth] onboarding repair: created organization ${org.id} for user ${user.id}`,
+  );
+  return org.id;
+}
 
 async function resolveOrganizationId(
   admin: ReturnType<typeof createClient>,
-  userId: string,
+  user: AuthUserLike,
 ): Promise<string | null> {
   const { data: memberships, error: memberError } = await admin
     .from('organization_members')
     .select('organization_id')
-    .eq('user_id', userId)
+    .eq('user_id', user.id)
     .order('organization_id', { ascending: true })
     .limit(1);
 
@@ -303,7 +366,11 @@ async function resolveOrganizationId(
   }
 
   const first = Array.isArray(memberships) ? memberships[0] : memberships;
-  return first?.organization_id ?? null;
+  if (first?.organization_id) return first.organization_id;
+
+  // No membership at all -> complete onboarding server-side and return
+  // the freshly created tenant instead of failing with 400.
+  return ensureOrganizationForUser(admin, user);
 }
 
 // ---------------------------------------------------------------------------
@@ -360,13 +427,13 @@ Deno.serve(async (req: Request) => {
   // There is NO organization_id column on `profiles`.
   let organizationId: string | null = null;
   try {
-    organizationId = await resolveOrganizationId(admin, user.id);
+    organizationId = await resolveOrganizationId(admin, user);
   } catch (e) {
     return json(
       {
         error: e instanceof Error ? e.message : 'Failed to resolve organization.',
         hint:
-          'Ensure the user has a row in public.organization_members (organization_id, user_id).',
+          'Automatic onboarding repair failed. Check the Edge Function logs for "onboarding repair" and ensure the user can own a row in public.organization_members (organization_id, user_id, role).',
       },
       400,
     );
