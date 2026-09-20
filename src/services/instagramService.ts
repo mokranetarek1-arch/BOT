@@ -11,6 +11,14 @@ import { SocialAccount } from '@/types';
 
 const STATE_KEY = 'instagram_oauth_state';
 
+/**
+ * One-time-use protection for Instagram authorization codes.
+ * sessionStorage survives page refreshes within the same tab, so a code we
+ * already submitted can never be resubmitted by refreshing the callback URL,
+ * re-firing effects or (in dev) React StrictMode double-mounts.
+ */
+const CODE_SENT_KEY_PREFIX = 'instagram_oauth_code_sent_';
+
 /** The redirect URI registered in the Meta dashboard. Configured via .env. */
 export const INSTAGRAM_REDIRECT_URI: string =
   import.meta.env.VITE_INSTAGRAM_REDIRECT_URI ?? '';
@@ -115,10 +123,43 @@ export const instagramService = {
   },
 
   /**
+   * True if this authorization code was already sent to the Edge Function in
+   * this browser tab (guarantees each code is submitted exactly once).
+   */
+  wasCodeSent(code: string): boolean {
+    try {
+      return sessionStorage.getItem(CODE_SENT_KEY_PREFIX + code) !== null;
+    } catch {
+      return false;
+    }
+  },
+
+  /**
    * Verify the `state` echoed back by Instagram matches the one we stored,
    * then send the `code` to the backend for exchange + storage.
+   *
+   * The code is submitted EXACTLY ONCE: it is marked as sent in
+   * sessionStorage before the network call, and any second attempt with the
+   * same code is refused (Instagram codes are strictly one-time-use).
    */
   async handleCallback(code: string, state: string | null): Promise<EdgeResult> {
+    if (this.wasCodeSent(code)) {
+      const err = new Error(
+        'This authorization code was already submitted. Instagram codes are one-time-use — start a new connection.'
+      );
+      err.name = 'CodeAlreadySent';
+      throw err;
+    }
+    // Mark as sent BEFORE the network call so a concurrent double-invoke
+    // (effect re-fire / StrictMode) is blocked too. If storage is unavailable
+    // the guard degrades gracefully; the Edge Function still enforces
+    // one-time-use server-side.
+    try {
+      sessionStorage.setItem(CODE_SENT_KEY_PREFIX + code, '1');
+    } catch {
+      /* ignore storage errors */
+    }
+
     const expectedState = sessionStorage.getItem(STATE_KEY);
     if (expectedState && state !== expectedState) {
       throw new Error('OAuth state mismatch — possible CSRF. Please retry.');

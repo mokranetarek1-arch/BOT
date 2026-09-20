@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { instagramService } from '@/services/instagramService';
 import { SocialAccount } from '@/types';
 import { Button } from '@/components/ui/button';
@@ -36,6 +36,15 @@ export default function InstagramConnect({
   // has arrived yet, the UI shows the callback phase.
   const showCallback = phase === 'callback' && !!code;
 
+  // Latest-ref: the parent may recreate `onCallbackHandled` after it clears
+  // the URL params. Keeping it in a ref lets the OAuth effect below depend
+  // only on [code, state] so it can never re-fire with the same code when the
+  // callback identity changes.
+  const onCallbackHandledRef = useRef(onCallbackHandled);
+  useEffect(() => {
+    onCallbackHandledRef.current = onCallbackHandled;
+  });
+
   // Handle the OAuth redirect back (?code=...&state=...) and load existing state.
   useEffect(() => {
     let cancelled = false;
@@ -49,6 +58,37 @@ export default function InstagramConnect({
         })
         .catch(() => {
           if (!cancelled) setAccount(null);
+        });
+      return () => {
+        cancelled = true;
+      };
+    }
+
+    // Instagram authorization codes are strictly one-time-use: NEVER submit
+    // the same code twice (effect re-fire, page refresh on the callback URL,
+    // React StrictMode double-mount in dev). If it was already sent, refresh
+    // the local state and clean the URL instead of calling the Edge Function.
+    if (instagramService.wasCodeSent(code)) {
+      onCallbackHandledRef.current?.(); // remove code/state from the URL
+      instagramService
+        .getConnectedAccount()
+        .then((existing) => {
+          if (cancelled) return;
+          setAccount(existing);
+          setPhase(existing ? 'done' : 'idle');
+          setMessage(
+            existing
+              ? `Connected${existing.account_name ? ` as @${existing.account_name}` : ''}.`
+              : 'This authorization code was already used. Please start a new connection.',
+          );
+        })
+        .catch(() => {
+          if (!cancelled) {
+            setPhase('idle');
+            setMessage(
+              'This authorization code was already used. Please start a new connection.',
+            );
+          }
         });
       return () => {
         cancelled = true;
@@ -81,13 +121,13 @@ export default function InstagramConnect({
           .catch(() => {
             if (!cancelled) setAccount(null);
           });
-        onCallbackHandled?.();
+        onCallbackHandledRef.current?.();
       });
 
     return () => {
       cancelled = true;
     };
-  }, [code, state, onCallbackHandled]);
+  }, [code, state]);
 
   const handleConnect = async () => {
     setPhase('connecting');

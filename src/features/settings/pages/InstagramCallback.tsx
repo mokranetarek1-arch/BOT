@@ -19,14 +19,18 @@ export default function InstagramCallback() {
   const initialCode = useMemo(() => code, []); // eslint-disable-line react-hooks/exhaustive-deps
   const initialState = useMemo(() => state, []); // eslint-disable-line react-hooks/exhaustive-deps
 
+  // Stable identity: reads the URL at call time instead of capturing
+  // `searchParams`, so clearing the params never recreates this callback.
+  // (A changing identity used to re-fire the OAuth effect in InstagramConnect
+  // with the same, already-consumed authorization code.)
   const handleDone = useCallback(() => {
-    const next = new URLSearchParams(searchParams);
+    const next = new URLSearchParams(window.location.search);
     next.delete('code');
     next.delete('state');
     next.delete('error');
     next.delete('error_reason');
     setSearchParams(next, { replace: true });
-  }, [searchParams, setSearchParams]);
+  }, [setSearchParams]);
 
   return (
     <div className="p-6 max-w-2xl">
