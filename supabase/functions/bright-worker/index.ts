@@ -453,6 +453,11 @@ async function persistEvent(
         organization_id: resolvedOrgId,
         // Name will be updated later if profile data becomes available
         name: `${event.channel} user ${event.external_user_id.slice(-6)}`,
+        // Provenance of the contact: the channel its first message arrived on.
+        // For Instagram DMs event.channel is exactly 'instagram' (set by the
+        // parser) — no inference, no AI. Only written on creation, never on an
+        // existing contact.
+        source: event.channel,
       })
       .select('id')
       .single();

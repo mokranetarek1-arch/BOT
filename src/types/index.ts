@@ -62,11 +62,42 @@ export interface Message {
   created_at: string;
 }
 
+/** Allowed values of contacts.lead_status (mirrors the DB CHECK constraint). */
+export type LeadStatus = 'new' | 'contacted' | 'qualified' | 'won' | 'lost';
+
+/** Allowed values of contacts.customer_status (mirrors the DB CHECK constraint). */
+export type CustomerStatus = 'prospect' | 'active' | 'inactive' | 'blocked';
+
+/**
+ * CRM contact — a row of public.contacts.
+ *
+ * Identity fields (phone/email/company/city/wilaya/country/source) hold
+ * confirmed data only. Channel-scoped identity is intentionally NOT here:
+ * the Instagram username lives in contact_channels.username and the technical
+ * IGSID in contact_channels.external_user_id.
+ *
+ * AI-enriched fields (intent/interests/needs/sentiment/summary) are not part
+ * of this type — they will live in a separate table in a later phase so that
+ * inferred data is never mixed with confirmed data.
+ */
 export interface Contact {
   id: string;
   organization_id: string;
   name: string;
+  phone: string | null;
+  email: string | null;
+  company: string | null;
+  city: string | null;
+  wilaya: string | null;
+  country: string | null;
+  source: string | null;
+  lead_status: LeadStatus;
+  customer_status: CustomerStatus;
+  tags: string[];
+  notes: string | null;
+  last_contact_at: string | null;
   created_at: string;
+  updated_at: string;
 }
 
 export interface Conversation {

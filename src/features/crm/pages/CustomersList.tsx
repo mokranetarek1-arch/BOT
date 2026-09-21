@@ -1,6 +1,59 @@
+import { useEffect, useState } from 'react';
 import { Card, CardContent } from "@/components/ui/card";
+import { contactService } from '@/services/contactService';
+import { Contact } from '@/types';
+
+/** Badge colours per real customer_status value coming from the database. */
+const customerStatusClasses: Record<string, string> = {
+  prospect: 'bg-yellow-100 text-yellow-800',
+  active: 'bg-green-100 text-green-800',
+  inactive: 'bg-gray-100 text-gray-800',
+  blocked: 'bg-red-100 text-red-800',
+};
+
+/** city + wilaya, skipping missing values (never prints "undefined"). */
+function formatLocation(city: string | null, wilaya: string | null): string {
+  const parts = [city, wilaya].filter((value): value is string => Boolean(value && value.trim()));
+  return parts.length > 0 ? parts.join(', ') : '—';
+}
+
+/** Simple readable date for contacts.created_at. */
+function formatDate(iso: string | null): string {
+  if (!iso) return '—';
+  return new Date(iso).toLocaleDateString('en-GB', {
+    day: '2-digit',
+    month: 'short',
+    year: 'numeric',
+  });
+}
 
 export default function CustomersList() {
+  const [customers, setCustomers] = useState<Contact[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+
+  // Initial load (same pattern as Inbox): every setState lives in the promise
+  // chain, nothing runs synchronously inside the effect body.
+  useEffect(() => {
+    let cancelled = false;
+    contactService
+      .listCustomers()
+      .then((list) => {
+        if (!cancelled) setCustomers(list);
+      })
+      .catch((err) => {
+        if (!cancelled) {
+          setError(err instanceof Error ? err.message : 'Could not load customers.');
+        }
+      })
+      .finally(() => {
+        if (!cancelled) setLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
   return (
     <div className="p-6">
       <div className="flex justify-between items-center mb-6">
@@ -22,19 +75,62 @@ export default function CustomersList() {
                 </tr>
               </thead>
               <tbody className="divide-y">
-                {[1, 2, 3, 4, 5].map(i => (
-                  <tr key={i} className="bg-card hover:bg-muted/50">
-                    <td className="px-6 py-4 font-medium">Customer {i}</td>
-                    <td className="px-6 py-4">Algiers, AL</td>
-                    <td className="px-6 py-4">
-                      <span className="px-2 py-1 rounded-full bg-green-100 text-green-800 text-xs font-medium">Active</span>
-                    </td>
-                    <td className="px-6 py-4 text-muted-foreground">Sep 20, 2026</td>
-                    <td className="px-6 py-4">
-                      <button className="text-primary hover:underline font-medium text-xs">View</button>
+                {loading && (
+                  <tr className="bg-card">
+                    <td className="px-6 py-6 text-muted-foreground" colSpan={5}>
+                      Loading customers…
                     </td>
                   </tr>
-                ))}
+                )}
+
+                {!loading && error && (
+                  <tr className="bg-card">
+                    <td className="px-6 py-6 text-destructive" colSpan={5}>
+                      {error}
+                    </td>
+                  </tr>
+                )}
+
+                {!loading && !error && customers.length === 0 && (
+                  <tr className="bg-card">
+                    <td className="px-6 py-6 text-muted-foreground" colSpan={5}>
+                      No customers yet.
+                    </td>
+                  </tr>
+                )}
+
+                {!loading &&
+                  !error &&
+                  customers.map((customer) => (
+                    <tr key={customer.id} className="bg-card hover:bg-muted/50">
+                      <td className="px-6 py-4 font-medium">{customer.name}</td>
+                      <td className="px-6 py-4">
+                        {formatLocation(customer.city, customer.wilaya)}
+                      </td>
+                      <td className="px-6 py-4">
+                        <span
+                          className={`px-2 py-1 rounded-full text-xs font-medium ${
+                            customerStatusClasses[customer.customer_status] ??
+                            'bg-secondary text-secondary-foreground'
+                          }`}
+                        >
+                          {customer.customer_status}
+                        </span>
+                      </td>
+                      <td className="px-6 py-4 text-muted-foreground">
+                        {formatDate(customer.created_at)}
+                      </td>
+                      <td className="px-6 py-4">
+                        <button
+                          disabled
+                          title="Contact details are not available yet"
+                          className="text-primary font-medium text-xs opacity-50 cursor-not-allowed"
+                        >
+                          View
+                        </button>
+                      </td>
+                    </tr>
+                  ))}
               </tbody>
             </table>
           </div>
