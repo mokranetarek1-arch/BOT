@@ -250,6 +250,137 @@ async function getMessageColumns(
   return existing;
 }
 
+/**
+ * Best-effort contact identity enrichment (Phase 1.5).
+ *
+ * Instagram DM webhooks carry ONLY identifiers (IGSIDs) — no username or
+ * display name. The sender's username can be obtained officially from the
+ * Message Details API using the message ID and the receiving account's
+ * stored Instagram User access token:
+ *   GET https://graph.instagram.com/v25.0/<MESSAGE_ID>
+ *       ?fields=id,created_time,from,to,message
+ *
+ * Rules:
+ *  - Runs ONLY for placeholder-named contacts ("instagram user 123456" /
+ *    empty / unknown) so the API is NOT called for every message.
+ *  - Never throws and never alters the ingestion outcome: on any failure the
+ *    placeholder name is kept and a warning is logged.
+ *  - The access token is read from social_accounts (service role) and is
+ *    NEVER logged.
+ */
+async function enrichContactUsername(
+  supabase: ReturnType<typeof createClient>,
+  params: { socialAccountId: string; contactChannelId: string; messageId: string },
+): Promise<void> {
+  const isPlaceholderName = (name: string | null | undefined): boolean => {
+    const value = (name ?? '').trim().toLowerCase();
+    if (!value) return true;
+    if (value === 'unknown' || value === 'unknown contact') return true;
+    // Names created by this worker: "<channel> user <last-6-of-IGSID>"
+    return /^(instagram|facebook) user /i.test(name ?? '');
+  };
+
+  try {
+    // 1. The receiving account's stored Instagram User access token.
+    const { data: socialAccount, error: saError } = await supabase
+      .from('social_accounts')
+      .select('access_token')
+      .eq('id', params.socialAccountId)
+      .maybeSingle();
+    if (saError) {
+      console.warn(
+        `CONTACT_ENRICH_SKIPPED: social_accounts access_token unavailable (${saError.message})`,
+      );
+      return;
+    }
+    const accessToken = socialAccount?.access_token as string | undefined | null;
+    if (!accessToken) {
+      console.warn(
+        'CONTACT_ENRICH_SKIPPED: no access token stored for this social account (reconnect to enable username enrichment)',
+      );
+      return;
+    }
+
+    // 2. Current contact/channel state. Skip if already enriched — this is
+    //    what keeps the Message Details API from being called per message.
+    const { data: channel } = await supabase
+      .from('contact_channels')
+      .select('contact_id, profile_data')
+      .eq('id', params.contactChannelId)
+      .maybeSingle();
+    const channelProfile = channel?.profile_data as Record<string, unknown> | null;
+    if (!channel?.contact_id) {
+      console.warn('CONTACT_ENRICH_SKIPPED: contact_channel not found');
+      return;
+    }
+    if (channelProfile?.['username']) {
+      return; // username already known from a previous message
+    }
+
+    const { data: contact } = await supabase
+      .from('contacts')
+      .select('id, name')
+      .eq('id', channel.contact_id)
+      .maybeSingle();
+    if (!contact) {
+      console.warn('CONTACT_ENRICH_SKIPPED: contact not found');
+      return;
+    }
+    if (!isPlaceholderName(contact.name as string | undefined)) {
+      return; // a real name is already present
+    }
+
+    // 3. Message Details API — the official, documented username source.
+    const detailsUrl = new URL(
+      `https://graph.instagram.com/v25.0/${encodeURIComponent(params.messageId)}`,
+    );
+    detailsUrl.searchParams.set('fields', 'id,created_time,from,to,message');
+    detailsUrl.searchParams.set('access_token', accessToken);
+
+    const res = await fetch(detailsUrl.toString());
+    const details = await res.json();
+    if (!res.ok || details?.error) {
+      console.warn(
+        `CONTACT_ENRICH_FAILED: message details request failed (${details?.error?.message ?? res.status})`,
+      );
+      return;
+    }
+
+    const detailsPayload = Array.isArray(details?.data) ? details.data[0] : details;
+    const username = detailsPayload?.from?.username as string | undefined;
+    if (!username) {
+      console.warn('CONTACT_ENRICH_FAILED: no username in message details response');
+      return;
+    }
+
+    // 4. Persist the Meta-trusted username. contacts.name is updated only
+    //    while it is still a placeholder; existing real names are never
+    //    overwritten.
+    if (isPlaceholderName(contact.name as string | undefined)) {
+      await supabase
+        .from('contacts')
+        .update({ name: username })
+        .eq('id', contact.id);
+    }
+
+    const mergedProfile = {
+      ...((channelProfile ?? {}) as Record<string, unknown>),
+      username,
+    };
+    await supabase
+      .from('contact_channels')
+      .update({ profile_data: mergedProfile })
+      .eq('id', params.contactChannelId);
+
+    console.log(`CONTACT_ENRICHED: contact=${contact.id} username=${username}`);
+  } catch (e) {
+    console.warn(
+      'CONTACT_ENRICH_FAILED:',
+      e instanceof Error ? e.message : String(e),
+    );
+  }
+}
+
 async function persistEvent(
   supabase: ReturnType<typeof createClient>,
   event: NormalizedEvent,
@@ -450,6 +581,15 @@ async function persistEvent(
     platform: event.channel,
     external_account_id: event.social_account_external_id,
     payload: event.raw_data,
+  });
+
+  // 6. Best-effort contact identity enrichment (username via the Message
+  //    Details API). Only for placeholder-named contacts; failures are
+  //    logged and never affect the saved message.
+  await enrichContactUsername(supabase, {
+    socialAccountId,
+    contactChannelId,
+    messageId: event.external_message_id,
   });
 
   console.log('[bright-worker] ✅ Event persisted successfully. message_id:', event.external_message_id);
