@@ -1,18 +1,12 @@
 import { useEffect, useState } from 'react';
+import { useNavigate } from 'react-router-dom';
 import { Card, CardContent } from "@/components/ui/card";
 import { contactService } from '@/services/contactService';
 import { Contact } from '@/types';
-
-/** Badge colours per real lead_status value coming from the database. */
-const leadStatusClasses: Record<string, string> = {
-  new: 'bg-yellow-100 text-yellow-800',
-  contacted: 'bg-blue-100 text-blue-800',
-  qualified: 'bg-indigo-100 text-indigo-800',
-  won: 'bg-green-100 text-green-800',
-  lost: 'bg-red-100 text-red-800',
-};
+import { leadStatusClasses } from '../crmFormat';
 
 export default function LeadsList() {
+  const navigate = useNavigate();
   const [leads, setLeads] = useState<Contact[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -101,9 +95,8 @@ export default function LeadsList() {
                       </td>
                       <td className="px-6 py-4">
                         <button
-                          disabled
-                          title="Contact details are not available yet"
-                          className="text-primary font-medium text-xs opacity-50 cursor-not-allowed"
+                          onClick={() => navigate(`/crm/contacts/${lead.id}`)}
+                          className="text-primary font-medium text-xs hover:underline"
                         >
                           View
                         </button>

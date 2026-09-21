@@ -1,33 +1,12 @@
 import { useEffect, useState } from 'react';
+import { useNavigate } from 'react-router-dom';
 import { Card, CardContent } from "@/components/ui/card";
 import { contactService } from '@/services/contactService';
 import { Contact } from '@/types';
-
-/** Badge colours per real customer_status value coming from the database. */
-const customerStatusClasses: Record<string, string> = {
-  prospect: 'bg-yellow-100 text-yellow-800',
-  active: 'bg-green-100 text-green-800',
-  inactive: 'bg-gray-100 text-gray-800',
-  blocked: 'bg-red-100 text-red-800',
-};
-
-/** city + wilaya, skipping missing values (never prints "undefined"). */
-function formatLocation(city: string | null, wilaya: string | null): string {
-  const parts = [city, wilaya].filter((value): value is string => Boolean(value && value.trim()));
-  return parts.length > 0 ? parts.join(', ') : '—';
-}
-
-/** Simple readable date for contacts.created_at. */
-function formatDate(iso: string | null): string {
-  if (!iso) return '—';
-  return new Date(iso).toLocaleDateString('en-GB', {
-    day: '2-digit',
-    month: 'short',
-    year: 'numeric',
-  });
-}
+import { customerStatusClasses, formatDate, formatLocation } from '../crmFormat';
 
 export default function CustomersList() {
+  const navigate = useNavigate();
   const [customers, setCustomers] = useState<Contact[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -122,9 +101,8 @@ export default function CustomersList() {
                       </td>
                       <td className="px-6 py-4">
                         <button
-                          disabled
-                          title="Contact details are not available yet"
-                          className="text-primary font-medium text-xs opacity-50 cursor-not-allowed"
+                          onClick={() => navigate(`/crm/contacts/${customer.id}`)}
+                          className="text-primary font-medium text-xs hover:underline"
                         >
                           View
                         </button>

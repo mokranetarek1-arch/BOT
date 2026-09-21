@@ -100,6 +100,23 @@ export interface Contact {
   updated_at: string;
 }
 
+/**
+ * A channel-scoped identity of a contact — a row of public.contact_channels.
+ *
+ * `external_user_id` is a technical identifier only (the IGSID for Instagram):
+ * it is never a display name and never a CRM identifier.
+ * `profile_data` is jsonb written by the ingestion function and its shape is
+ * NOT guaranteed, so it is typed as unknown and must be validated before use.
+ */
+export interface ContactChannel {
+  id: string;
+  channel: string;
+  external_user_id: string;
+  username: string | null;
+  profile_data: unknown;
+  created_at: string;
+}
+
 export interface Conversation {
   id: string;
   organization_id: string;
@@ -126,7 +143,19 @@ export interface Message {
   /** 'text' | 'image' | 'video' | 'audio' | 'story_mention' | 'unsupported' */
   message_type: string;
   message_text: string | null;
-  /** Full raw webhook payload, preserved for debugging / future phases. */
+  /** 'inbound' | 'outbound' — the migration column of the same name. */
+  direction?: string | null;
+  /** Channel the message travelled over (instagram / facebook / whatsapp). */
+  channel?: string | null;
+  /**
+   * Attachment metadata exactly as Meta provides it (type + payload URL).
+   * Never analyzed: it is displayed as-is and must be validated at runtime.
+   */
+  attachments?: unknown;
+  /**
+   * Full raw webhook payload. Intentionally NOT selected by the CRM views —
+   * it is only requested where it is genuinely needed (debugging).
+   */
   raw_data?: unknown;
   created_at: string;
 }

@@ -5,6 +5,7 @@ import DashboardOverview from '@/features/dashboard/pages/DashboardOverview';
 import Inbox from '@/features/inbox/pages/Inbox';
 import CustomersList from '@/features/crm/pages/CustomersList';
 import LeadsList from '@/features/crm/pages/LeadsList';
+import ContactDetails from '@/features/crm/pages/ContactDetails';
 import AISettings from '@/features/ai/pages/AISettings';
 import Analytics from '@/features/analytics/pages/Analytics';
 import Settings from '@/features/settings/pages/Settings';
@@ -22,6 +23,7 @@ export const router = createBrowserRouter([
       { path: 'inbox', element: <Inbox /> },
       { path: 'crm/customers', element: <CustomersList /> },
       { path: 'crm/leads', element: <LeadsList /> },
+      { path: 'crm/contacts/:id', element: <ContactDetails /> },
       { path: 'ai', element: <AISettings /> },
       { path: 'analytics', element: <Analytics /> },
       { path: 'settings', element: <Settings /> },
