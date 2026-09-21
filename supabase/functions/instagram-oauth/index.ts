@@ -257,11 +257,21 @@ async function exchangeCodeForToken(
 async function fetchProfile(
   cfg: OAuthConfig,
   accessToken: string,
-): Promise<{ id: string; username: string | null; accountType: string | null }> {
+): Promise<{
+  id: string;
+  /** Instagram professional account ID (`user_id`) — the exact ID Meta
+   * delivers in webhook notifications for this account. */
+  professionalId: string;
+  username: string | null;
+  accountType: string | null;
+}> {
   // Instagram Login: graph.instagram.com/me
   // Facebook mode: graph.facebook.com/me/accounts -> instagram_business_account
   const url = new URL(`${cfg.graphBase}/me`);
-  url.searchParams.set('fields', 'id,username,account_type');
+  // `id` is the app-scoped ID; `user_id` is the Instagram professional
+  // account ID (IG_ID) — per Meta docs, user_id is the value of the `id`
+  // field received in webhook notifications for this account.
+  url.searchParams.set('fields', 'id,user_id,username,account_type');
   url.searchParams.set('access_token', accessToken);
 
   const res = await fetch(url.toString());
@@ -272,10 +282,15 @@ async function fetchProfile(
     );
   }
 
+  // Meta may return the profile either as a flat object or wrapped in a
+  // `data` array (documented for the user_id/username field combination).
+  const profileData = Array.isArray(data?.data) ? data.data[0] : data;
+
   return {
-    id: String(data.id ?? ''),
-    username: data.username ?? null,
-    accountType: data.account_type ?? null,
+    id: String(profileData?.id ?? ''),
+    professionalId: String(profileData?.user_id ?? ''),
+    username: profileData?.username ?? null,
+    accountType: profileData?.account_type ?? null,
   };
 }
 
@@ -500,7 +515,8 @@ Deno.serve(async (req: Request) => {
       const token = await exchangeCodeForToken(cfg, code, redirectUri);
       const profile = await fetchProfile(cfg, token.accessToken);
 
-      const externalAccountId = profile.id || token.userId;
+      const externalAccountId =
+        profile.professionalId || profile.id || token.userId;
       if (!externalAccountId) {
         return json({ error: 'Could not resolve Instagram account id.' }, 502);
       }
