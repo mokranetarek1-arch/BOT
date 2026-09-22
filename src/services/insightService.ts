@@ -27,6 +27,17 @@ import type {
 const INSIGHT_FIELDS =
   'id, organization_id, contact_id, conversation_id, insight_type, value, confidence, model, prompt_version, source_message_ids, created_at, updated_at';
 
+/**
+ * Explicit column list for crm_custom_fields — never `select('*')`.
+ * `updated_at` is deliberately NOT selected: the UI never uses it and some
+ * databases were created with a reduced schema that has no such column, which
+ * made every read fail with "column crm_custom_fields.updated_at does not
+ * exist". The column is still provisioned by the migration and maintained by
+ * a trigger for future use.
+ */
+const CUSTOM_FIELD_COLUMNS =
+  'id, organization_id, field_name, field_label, field_type, options, description_for_ai, created_at';
+
 /** Must match the value returned by the AI backend's prompt_version. */
 const DEFAULT_PROMPT_VERSION = 'lead-analyzer-v1';
 const DEFAULT_MODEL = 'gemini-3.5-flash-lite';
@@ -353,9 +364,7 @@ export const insightService = {
   async listCustomFields(organizationId: string): Promise<CrmCustomField[]> {
     const { data, error } = await supabase
       .from('crm_custom_fields')
-      .select(
-        'id, organization_id, field_name, field_label, field_type, options, description_for_ai, created_at, updated_at',
-      )
+      .select(CUSTOM_FIELD_COLUMNS)
       .eq('organization_id', organizationId)
       .order('created_at', { ascending: true });
 
@@ -372,9 +381,7 @@ export const insightService = {
     const { data, error } = await supabase
       .from('crm_custom_fields')
       .insert({ organization_id: organizationId, ...normalized })
-      .select(
-        'id, organization_id, field_name, field_label, field_type, options, description_for_ai, created_at, updated_at',
-      )
+      .select(CUSTOM_FIELD_COLUMNS)
       .single();
     if (error) throw new Error(error.message);
     return data as unknown as CrmCustomField;

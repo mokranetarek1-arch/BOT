@@ -218,7 +218,8 @@ export interface CrmCustomField {
   options: string[] | null;
   description_for_ai: string | null;
   created_at: string;
-  updated_at: string;
+  /** Maintained by a DB trigger; not selected by the app (may be absent). */
+  updated_at?: string;
 }
 
 /** Dynamic values object stored in contact_custom_values.values (JSONB). */
