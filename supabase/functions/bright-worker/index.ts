@@ -381,6 +381,74 @@ async function enrichContactUsername(
   }
 }
 
+// ---------------------------------------------------------------------------
+// AI LEAD ANALYZER — automatic background pipeline trigger (best-effort).
+//
+// Fired once per saved inbound message. The AI backend (Render) loads the
+// conversation transcript + the organization's custom CRM fields, runs the
+// Gemini analysis and writes insights / custom values / contact updates —
+// completely server-side, without any user interaction.
+//
+// Behavior contract (mirrors enrichContactUsername):
+//  - Enabled ONLY when AI_BACKEND_URL is configured in Supabase secrets.
+//  - Optional shared secret: AI_BACKEND_WEBHOOK_SECRET is sent in the
+//    `x-webhook-secret` header and is NEVER logged.
+//  - Never throws and never alters the ingestion outcome: on any failure a
+//    warning is logged and the message stays saved.
+// ---------------------------------------------------------------------------
+async function triggerAiLeadAnalysis(params: {
+  organizationId: string;
+  contactId: string;
+  conversationId: string;
+  messageId: string;
+}): Promise<void> {
+  if (!params.contactId || !params.conversationId) {
+    console.warn('AI_ANALYSIS_SKIPPED: missing contact or conversation id');
+    return;
+  }
+  const backendUrl = (Deno.env.get('AI_BACKEND_URL') ?? '').trim().replace(/\/+$/, '');
+  if (!backendUrl) {
+    console.log(
+      'AI_ANALYSIS_SKIPPED: AI_BACKEND_URL not configured (set it in Supabase secrets to enable the automatic pipeline)',
+    );
+    return;
+  }
+
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 25_000);
+  try {
+    const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+    const secret = (Deno.env.get('AI_BACKEND_WEBHOOK_SECRET') ?? '').trim();
+    if (secret) headers['x-webhook-secret'] = secret;
+
+    const res = await fetch(`${backendUrl}/ai/webhook/message`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({
+        organization_id: params.organizationId,
+        contact_id: params.contactId,
+        conversation_id: params.conversationId,
+        message_id: params.messageId,
+      }),
+      signal: controller.signal,
+    });
+
+    if (!res.ok) {
+      const detail = await res.text().catch(() => '');
+      console.warn(`AI_ANALYSIS_FAILED: backend responded ${res.status} ${detail.slice(0, 200)}`);
+    } else {
+      console.log('AI_ANALYSIS_OK: lead analysis written by the AI backend');
+    }
+  } catch (e) {
+    console.warn(
+      'AI_ANALYSIS_FAILED:',
+      e instanceof Error ? e.message : String(e),
+    );
+  } finally {
+    clearTimeout(timeoutId);
+  }
+}
+
 async function persistEvent(
   supabase: ReturnType<typeof createClient>,
   event: NormalizedEvent,
@@ -596,6 +664,25 @@ async function persistEvent(
     contactChannelId,
     messageId: event.external_message_id,
   });
+
+  // 7. Fire-and-forget: automatic AI lead analysis on every inbound message.
+  //    The AI backend (Render) does everything server-side; this call must
+  //    never block or fail the webhook, so it runs in the background
+  //    (EdgeRuntime.waitUntil) with its own timeout.
+  const aiTrigger = triggerAiLeadAnalysis({
+    organizationId: resolvedOrgId,
+    contactId: contactId ?? '',
+    conversationId,
+    messageId: event.external_message_id,
+  });
+  const edgeRuntimeAi = (
+    globalThis as { EdgeRuntime?: { waitUntil?: (p: Promise<unknown>) => void } }
+  ).EdgeRuntime;
+  if (edgeRuntimeAi?.waitUntil) {
+    edgeRuntimeAi.waitUntil(aiTrigger);
+  } else {
+    await aiTrigger; // non-Edge fallback (local dev)
+  }
 
   console.log('[bright-worker] ✅ Event persisted successfully. message_id:', event.external_message_id);
 }

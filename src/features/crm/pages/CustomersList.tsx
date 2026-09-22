@@ -64,6 +64,36 @@ export default function CustomersList() {
     };
   }, []);
 
+  // Silent refresh when the tab becomes visible again: the automatic AI
+  // pipeline may have filled contacts / custom values in the background
+  // while this page was hidden. No loading spinner, failures are ignored.
+  useEffect(() => {
+    const refresh = () => {
+      if (document.visibilityState !== 'visible') return;
+      contactService
+        .listCustomers()
+        .then((list) => setCustomers(list))
+        .catch(() => {});
+      organizationService
+        .getCurrentOrganizationId()
+        .then(async (orgId) => {
+          const [fields, valuesMap] = await Promise.all([
+            insightService.listCustomFields(orgId),
+            insightService.listContactCustomValues(orgId),
+          ]);
+          setCustomFields(fields);
+          setValuesByContact(valuesMap);
+        })
+        .catch(() => {});
+    };
+    document.addEventListener('visibilitychange', refresh);
+    window.addEventListener('focus', refresh);
+    return () => {
+      document.removeEventListener('visibilitychange', refresh);
+      window.removeEventListener('focus', refresh);
+    };
+  }, []);
+
   const columnCount = 5 + customFields.length;
 
   return (

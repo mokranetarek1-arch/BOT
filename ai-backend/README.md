@@ -40,13 +40,16 @@ The server listens on `0.0.0.0` and uses `process.env.PORT || 3000`.
 
 ## 3. Required environment variable
 
-| Name             | Required | Purpose                                  |
-|------------------|----------|------------------------------------------|
-| `GEMINI_API_KEY` | Yes (for `/ai/test`) | Google Gemini API key |
-| `PORT`           | No       | HTTP port (defaults to 3000)             |
+| Name | Required | Purpose |
+|------|----------|---------|
+| `GEMINI_API_KEY` | Yes | Google Gemini API key (used by every AI route) |
+| `SUPABASE_URL` | Yes (automatic pipeline) | Supabase project URL — service-role DB access |
+| `SUPABASE_SERVICE_ROLE_KEY` | Yes (automatic pipeline) | Bypasses RLS so the pipeline can write insights/values/contacts |
+| `WEBHOOK_SECRET` | No | Optional shared secret for `/ai/webhook/message` (`x-webhook-secret` header) |
+| `PORT` | No | HTTP port (defaults to 3000) |
 
-The key is read from the environment only — it is never hardcoded, logged, or
-returned in any response.
+Secrets are read from the environment only — never hardcoded, logged, or
+returned in any response. `SUPABASE_SERVICE_ROLE_KEY` must never reach a browser.
 
 ## 4. Test GET /health
 
@@ -140,7 +143,51 @@ Notes:
 | Non-JSON / unusable model output    | 502         |
 | Gemini request timeout              | 504         |
 
-## 7. Deploying to Render (later — not yet)
+## 7. Automatic pipeline: POST /ai/webhook/message
+
+Fully automated background analysis — no user interaction required. Called by
+`bright-worker` (Supabase Edge Function) right after every inbound message is
+saved, in the background (`EdgeRuntime.waitUntil`) so the Meta webhook is never
+delayed.
+
+What the pipeline does, server-side:
+
+1. Loads the conversation transcript (last 20 messages) and the organization's
+   custom fields from `crm_custom_fields`.
+2. Sends transcript + `custom_schema` to Gemini (same prompt/validation as
+   `/ai/analyze-lead`).
+3. Writes results with the service role:
+   - `contact_ai_insights` → intent / interests / summary rows (upserted)
+   - `contact_custom_values` → extracted custom values, **merged** over
+     previous ones (older values are never lost)
+   - `contacts` → conservative updates only: `name` / `phone` filled when empty
+     or placeholder, `lead_status` only moves forward
+     (`new` → `contacted`, → `qualified` on a purchase intent or lead_score ≥ 70;
+     `won` / `lost` are never touched)
+
+Body:
+
+```json
+{ "organization_id": "uuid", "contact_id": "uuid", "conversation_id": "uuid", "message_id": "optional" }
+```
+
+Errors: `401` invalid webhook secret, `400` missing fields, `500` missing
+env/secrets, `404` unknown contact, `502`/Gemini status on model errors.
+
+Required Supabase secrets on the **bright-worker** function:
+
+| Secret | Purpose |
+|--------|---------|
+| `AI_BACKEND_URL` | e.g. `https://botd-ai-backend.onrender.com` — enables the trigger |
+| `AI_BACKEND_WEBHOOK_SECRET` | Only if `WEBHOOK_SECRET` is set on Render (same value) |
+
+```bash
+supabase secrets set AI_BACKEND_URL=https://botd-ai-backend.onrender.com \
+  --project-ref exoajfewjydcgxsslswq
+supabase functions deploy bright-worker --project-ref exoajfewjydcgxsslswq
+```
+
+## 8. Deploying to Render
 
 This directory can be deployed independently from the existing BOTD GitHub
 repository by setting the Render service's **Root Directory** to `ai-backend`.
@@ -153,7 +200,7 @@ Suggested Render configuration:
 | Root Directory | `ai-backend`                 |
 | Build Command  | `npm install && npm run build` |
 | Start Command  | `npm start`                  |
-| Env Var        | `GEMINI_API_KEY` = (your real key, set via Render dashboard) |
+| Env Vars       | `GEMINI_API_KEY`, `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`, optional `WEBHOOK_SECRET` |
 
 Render injects `PORT` automatically — the server already binds to
 `0.0.0.0:$PORT` and does not hardcode localhost.

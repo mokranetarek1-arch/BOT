@@ -10,6 +10,7 @@ import express, { type Request, type Response } from 'express';
 
 import { GEMINI_MODEL } from './config';
 import { callGemini, GeminiError } from './gemini';
+import { processInboundMessage } from './pipeline';
 import {
   MAX_MESSAGE_LENGTH,
   LEAD_GENERATION_CONFIG,
@@ -150,6 +151,69 @@ app.post('/ai/analyze-lead', async (req: Request, res: Response) => {
       success: false,
       error: 'Unexpected server error while analyzing the lead.',
     });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// POST /ai/webhook/message — AUTOMATIC background pipeline trigger.
+//
+// Called by bright-worker (Supabase Edge Function) on every inbound message.
+// The pipeline loads the conversation transcript + the organization's custom
+// CRM fields, runs the Gemini analysis and writes everything server-side:
+// contact_ai_insights + contact_custom_values + conservative contacts update.
+//
+// Auth: optional shared secret — when WEBHOOK_SECRET is set, callers must
+// send it in the `x-webhook-secret` header (bright-worker does).
+// Body: { organization_id, contact_id, conversation_id, message_id? }
+// ---------------------------------------------------------------------------
+app.post('/ai/webhook/message', async (req: Request, res: Response) => {
+  const expectedSecret = process.env.WEBHOOK_SECRET;
+  if (expectedSecret) {
+    const provided = req.header('x-webhook-secret');
+    if (provided !== expectedSecret) {
+      return res.status(401).json({ success: false, error: 'Invalid webhook secret.' });
+    }
+  }
+
+  const apiKey = process.env.GEMINI_API_KEY;
+  if (!apiKey) {
+    return res.status(500).json({
+      success: false,
+      error: 'GEMINI_API_KEY is not configured on the server.',
+    });
+  }
+
+  const body = (req.body ?? {}) as Record<string, unknown>;
+  const organizationId = typeof body.organization_id === 'string' ? body.organization_id.trim() : '';
+  const contactId = typeof body.contact_id === 'string' ? body.contact_id.trim() : '';
+  const conversationId = typeof body.conversation_id === 'string' ? body.conversation_id.trim() : '';
+
+  if (!organizationId || !contactId || !conversationId) {
+    return res.status(400).json({
+      success: false,
+      error: 'organization_id, contact_id and conversation_id are required strings.',
+    });
+  }
+
+  try {
+    const result = await processInboundMessage(apiKey, {
+      organizationId,
+      contactId,
+      conversationId,
+    });
+    return res.status(200).json({ success: true, ...result });
+  } catch (err) {
+    if (err instanceof GeminiSafeParseError) {
+      return res.status(502).json({ success: false, error: err.message });
+    }
+    if (err instanceof GeminiError) {
+      const status = err.status ?? 502;
+      return res.status(status).json({ success: false, error: err.safeMessage });
+    }
+    // Pipeline errors are safe messages built server-side (no secrets inside).
+    const message = err instanceof Error ? err.message : 'Automatic analysis failed.';
+    const status = message.includes('not found') ? 404 : 500;
+    return res.status(status).json({ success: false, error: message });
   }
 });
 

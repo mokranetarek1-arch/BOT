@@ -238,6 +238,40 @@ export default function ContactDetails() {
     };
   }, [id]);
 
+  // Silent refresh when the tab becomes visible again: the automatic AI
+  // pipeline writes insights / custom values / contact fields in the
+  // background as messages arrive, so the page stays current without a
+  // manual reload. Failures are ignored (the last rendered data stays).
+  useEffect(() => {
+    if (!id) return;
+    const refresh = () => {
+      if (document.visibilityState !== 'visible') return;
+      contactService
+        .getContactById(id)
+        .then((row) => {
+          if (row) setContact(row);
+        })
+        .catch(() => {});
+      insightService
+        .listContactInsights(id)
+        .then((list) => {
+          setInsights(list);
+          setInsightsError(null);
+        })
+        .catch(() => {});
+      insightService
+        .getContactCustomValues(id)
+        .then((values) => setCustomValues(values))
+        .catch(() => {});
+    };
+    document.addEventListener('visibilitychange', refresh);
+    window.addEventListener('focus', refresh);
+    return () => {
+      document.removeEventListener('visibilitychange', refresh);
+      window.removeEventListener('focus', refresh);
+    };
+  }, [id]);
+
   // Messages of the selected conversation (loading state is set by the click
   // handler, exactly like the Inbox, so nothing runs synchronously here).
   useEffect(() => {
@@ -477,17 +511,22 @@ export default function ContactDetails() {
           hidden as an internal technical detail. */}
       <Card className="mb-6">
         <CardContent className="p-6">
-          <div className="flex flex-wrap items-center justify-between gap-3 mb-4">
+          <div className="flex flex-wrap items-center justify-between gap-3 mb-2">
             <h2 className="font-semibold">AI Insights</h2>
             <button
               type="button"
               onClick={handleAnalyzeLead}
               disabled={analyzing}
+              title="The CRM is analyzed automatically on every new message — use this to force a fresh analysis."
               className="inline-flex items-center gap-2 h-9 px-4 rounded-md bg-gradient-to-r from-violet-600 to-indigo-600 text-white text-sm font-medium shadow hover:from-violet-500 hover:to-indigo-500 disabled:opacity-50 disabled:cursor-not-allowed"
             >
-              {analyzing ? '🪄 Analyzing…' : '🪄 Analyze Lead with AI'}
+              {analyzing ? '🪄 Re-analyzing…' : '🪄 Re-analyze with AI'}
             </button>
           </div>
+          <p className="text-xs text-muted-foreground mb-4">
+            Filled automatically from incoming messages by the AI pipeline — re-analyze any
+            time the customer sends something new.
+          </p>
 
           {analyzeError && <p className="text-sm text-destructive mb-3">{analyzeError}</p>}
           {analyzeNotice && <p className="text-sm text-green-600 mb-3">{analyzeNotice}</p>}
