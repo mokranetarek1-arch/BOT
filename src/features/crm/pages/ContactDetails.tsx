@@ -168,6 +168,7 @@ export default function ContactDetails() {
   // AI inferences of the contact, read-only. A failure here only fills the
   // AI Insights card — it never hides the contact, channels, or conversations.
   useEffect(() => {
+    if (!id) return;
     let cancelled = false;
     insightService
       .listContactInsights(id)

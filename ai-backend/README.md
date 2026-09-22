@@ -87,7 +87,60 @@ Error responses:
 | Invalid/unexpected Gemini response| 502         |
 | Gemini request timeout            | 504         |
 
-## 6. Deploying to Render (later — not yet)
+## 6. Test POST /ai/analyze-lead
+
+Lead analysis for the CRM smart pipeline. Accepts a customer message and
+returns a structured JSON-only extraction.
+
+```bash
+curl -X POST http://localhost:3000/ai/analyze-lead \
+  -H "Content-Type: application/json" \
+  -d '{
+    "message_text": "Hi! Im Karim, interested in the leather bag. How much? My number is 0555 123 456",
+    "contact_id": "00000000-0000-0000-0000-000000000000",
+    "organization_id": "00000000-0000-0000-0000-000000000000"
+  }'
+```
+
+Success response:
+
+```json
+{
+  "success": true,
+  "model": "gemini-3.5-flash-lite",
+  "prompt_version": "lead-analyzer-v1",
+  "contact_id": "00000000-0000-0000-0000-000000000000",
+  "organization_id": "00000000-0000-0000-0000-000000000000",
+  "data": {
+    "client_name": "Karim",
+    "phone_number": "0555 123 456",
+    "intent": "purchase",
+    "product_or_service": "leather bag",
+    "lead_score": 85,
+    "summary": "Karim asked about the price of the leather bag.",
+    "suggested_reply": "Hi Karim! The leather bag is ... "
+  }
+}
+```
+
+Notes:
+
+- `contact_id` / `organization_id` are validated and echoed back for
+  correlation — they are never sent to Gemini.
+- The model is forced to JSON-only output (`responseMimeType: application/json`)
+  and every field is validated/normalized server-side before returning.
+- `contact_id` and `organization_id` must be non-empty strings;
+  `message_text` is capped at 8000 characters.
+
+| Condition                          | HTTP status |
+|------------------------------------|-------------|
+| Missing `GEMINI_API_KEY`            | 500         |
+| Missing/invalid body fields         | 400         |
+| Gemini API error                    | Gemini's own status |
+| Non-JSON / unusable model output    | 502         |
+| Gemini request timeout              | 504         |
+
+## 7. Deploying to Render (later — not yet)
 
 This directory can be deployed independently from the existing BOTD GitHub
 repository by setting the Render service's **Root Directory** to `ai-backend`.

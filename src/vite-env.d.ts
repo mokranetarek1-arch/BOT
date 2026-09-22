@@ -7,6 +7,8 @@ interface ImportMetaEnv {
   readonly VITE_SUPABASE_PUBLISHABLE_KEY: string;
   /** Must exactly match the OAuth redirect URI registered in the Meta dashboard. */
   readonly VITE_INSTAGRAM_REDIRECT_URI: string;
+  /** Base URL of the AI backend (Render). No secrets — public URL only. */
+  readonly VITE_AI_BACKEND_URL: string;
 }
 
 interface ImportMeta {

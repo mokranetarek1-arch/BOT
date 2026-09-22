@@ -21,6 +21,8 @@ export interface CallGeminiParams {
   apiKey: string;
   model: string;
   prompt: string;
+  /** Optional Gemini generationConfig (e.g. responseMimeType, temperature). */
+  generationConfig?: Record<string, unknown>;
 }
 
 /** Extracts the first text candidate from a Gemini generateContent response. */
@@ -40,7 +42,12 @@ function extractText(data: unknown): string | null {
   return texts.length > 0 ? texts.join('') : null;
 }
 
-export async function callGemini({ apiKey, model, prompt }: CallGeminiParams): Promise<string> {
+export async function callGemini({
+  apiKey,
+  model,
+  prompt,
+  generationConfig,
+}: CallGeminiParams): Promise<string> {
   const endpoint = `${GEMINI_BASE_URL}/models/${model}:generateContent?key=${encodeURIComponent(apiKey)}`;
 
   const controller = new AbortController();
@@ -52,6 +59,7 @@ export async function callGemini({ apiKey, model, prompt }: CallGeminiParams): P
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         contents: [{ role: 'user', parts: [{ text: prompt }] }],
+        ...(generationConfig ? { generationConfig } : {}),
       }),
       signal: controller.signal,
     });
