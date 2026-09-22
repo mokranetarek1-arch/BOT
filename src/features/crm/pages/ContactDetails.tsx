@@ -3,7 +3,8 @@ import { useNavigate, useParams } from 'react-router-dom';
 import { Card, CardContent } from '@/components/ui/card';
 import { contactService } from '@/services/contactService';
 import { conversationService } from '@/services/conversationService';
-import { Contact, ContactChannel, Conversation, Message } from '@/types';
+import { Contact, ContactChannel, ContactInsight, Conversation, Message } from '@/types';
+import { insightService } from '@/services/insightService';
 import {
   channelBadgeClasses,
   conversationStatusClasses,
@@ -14,6 +15,31 @@ import {
   leadStatusClasses,
   textOrDash,
 } from '../crmFormat';
+
+/** Badge colours per contact_ai_insights.insight_type value. */
+const insightTypeClasses: Record<string, string> = {
+  intent: 'bg-indigo-100 text-indigo-800',
+  interests: 'bg-purple-100 text-purple-800',
+  needs: 'bg-blue-100 text-blue-800',
+  buying_timeframe: 'bg-amber-100 text-amber-800',
+  sentiment: 'bg-teal-100 text-teal-800',
+  summary: 'bg-gray-100 text-gray-800',
+};
+
+/**
+ * Render an insight value (arbitrary JSON from a future analyzer) without
+ * assuming its shape. Strings print as-is; everything else prints as compact
+ * JSON so no data is lost.
+ */
+function insightValueText(value: unknown): string {
+  if (typeof value === 'string') return value.trim() ? value : '—';
+  if (value === null || value === undefined) return '—';
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return '—';
+  }
+}
 
 /**
  * Attachment metadata exactly as Meta provides it (type + payload reference).
@@ -64,6 +90,12 @@ export default function ContactDetails() {
 
   const [conversations, setConversations] = useState<Conversation[]>([]);
   const [conversationsError, setConversationsError] = useState<string | null>(null);
+
+  // AI inferences (contact_ai_insights). Own fetch; setState only runs in
+  // promise callbacks, so no render cascade is possible.
+  const [insights, setInsights] = useState<ContactInsight[]>([]);
+  const [insightsLoading, setInsightsLoading] = useState(true);
+  const [insightsError, setInsightsError] = useState<string | null>(null);
 
   const [selectedConversationId, setSelectedConversationId] = useState<string | null>(null);
   const [messages, setMessages] = useState<Message[]>([]);
@@ -127,6 +159,28 @@ export default function ContactDetails() {
             err instanceof Error ? err.message : 'Could not load conversations.'
           );
         }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [id]);
+
+  // AI inferences of the contact, read-only. A failure here only fills the
+  // AI Insights card — it never hides the contact, channels, or conversations.
+  useEffect(() => {
+    let cancelled = false;
+    insightService
+      .listContactInsights(id)
+      .then((list) => {
+        if (!cancelled) setInsights(list);
+      })
+      .catch((err) => {
+        if (!cancelled) {
+          setInsightsError(err instanceof Error ? err.message : 'Could not load insights.');
+        }
+      })
+      .finally(() => {
+        if (!cancelled) setInsightsLoading(false);
       });
     return () => {
       cancelled = true;
@@ -204,6 +258,11 @@ export default function ContactDetails() {
       </div>
     );
   }
+
+  // Insights come from their own contact-scoped fetch, so they are stored as
+  // the list itself — no cross-contact guard is needed.
+  const insightsForContact: ContactInsight[] = insights;
+  const insightsErrorForContact: string | null = !insightsLoading ? insightsError : null;
 
   return (
     <div className="p-6">
@@ -300,6 +359,62 @@ export default function ContactDetails() {
           </CardContent>
         </Card>
       </div>
+
+      {/* AI Insights — server-side inferences only (contact_ai_insights).
+          Physically separate from Contact Information because an inference is
+          never a confirmed fact. Nothing writes these rows in this phase; the
+          expected state is "No insights yet." `source_message_ids` stays
+          hidden as an internal technical detail. */}
+      <Card className="mb-6">
+        <CardContent className="p-6">
+          <h2 className="font-semibold mb-4">AI Insights</h2>
+
+          {insightsLoading && (
+            <p className="text-sm text-muted-foreground">Loading insights…</p>
+          )}
+
+          {insightsErrorForContact && (
+            <p className="text-sm text-destructive">
+              Could not load insights: {insightsErrorForContact}
+            </p>
+          )}
+
+          {!insightsLoading && !insightsErrorForContact && insightsForContact.length === 0 && (
+            <p className="text-sm text-muted-foreground">No insights yet.</p>
+          )}
+
+          {!insightsLoading && !insightsErrorForContact && insightsForContact.length > 0 && (
+            <ul className="space-y-3">
+              {insightsForContact.map((insight) => (
+                  <li key={insight.id} className="border rounded-md p-4">
+                    <div className="flex items-center gap-2 flex-wrap mb-2">
+                      <span
+                        className={`px-2 py-1 rounded-full text-xs font-medium ${
+                          insightTypeClasses[insight.insight_type] ??
+                          'bg-secondary text-secondary-foreground'
+                        }`}
+                      >
+                        {insight.insight_type}
+                      </span>
+                      {insight.confidence !== null && insight.confidence !== undefined && (
+                        <span className="text-xs text-muted-foreground">
+                          confidence {Number(insight.confidence).toFixed(2)}
+                        </span>
+                      )}
+                      <span className="text-xs text-muted-foreground ml-auto">
+                        {formatDateTime(insight.created_at)}
+                      </span>
+                    </div>
+                    <p className="text-sm whitespace-pre-wrap break-words">
+                      {insightValueText(insight.value)}
+                    </p>
+                    <p className="text-xs text-muted-foreground mt-2">model: {insight.model}</p>
+                  </li>
+                ))}
+              </ul>
+            )}
+        </CardContent>
+      </Card>
 
       {/* Conversations — a plain list on purpose: a contact can have several
           conversations (there is no unique constraint on contact_id). */}

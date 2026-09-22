@@ -117,6 +117,41 @@ export interface ContactChannel {
   created_at: string;
 }
 
+/**
+ * Allowed values of contact_ai_insights.insight_type (mirrors the DB CHECK).
+ */
+export type InsightType =
+  | 'intent'
+  | 'interests'
+  | 'needs'
+  | 'buying_timeframe'
+  | 'sentiment'
+  | 'summary';
+
+/**
+ * One AI inference row — public.contact_ai_insights.
+ *
+ * This is NEVER a confirmed fact: it carries its own provenance (model,
+ * prompt_version, source_message_ids) and confidence, and the UI must render
+ * it outside the Contact Information block.
+ */
+export interface ContactInsight {
+  id: string;
+  organization_id: string;
+  contact_id: string;
+  conversation_id: string | null;
+  insight_type: InsightType;
+  /** JSON payload — shape depends on insight_type; never assumed to be a string. */
+  value: unknown;
+  /** Postgres numeric arrives as a JSON number; null when the writer has none. */
+  confidence: number | null;
+  model: string;
+  prompt_version: string;
+  source_message_ids: string[];
+  created_at: string;
+  updated_at: string;
+}
+
 export interface Conversation {
   id: string;
   organization_id: string;
