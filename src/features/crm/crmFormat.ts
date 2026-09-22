@@ -37,6 +37,14 @@ export function textOrDash(value: string | null | undefined): string {
   return value && value.trim() ? value : '—';
 }
 
+/** Format a Dynamic CRM custom value for display (never prints raw JSON). */
+export function formatCustomValue(value: string | number | null | undefined): string {
+  if (value === null || value === undefined) return '—';
+  if (typeof value === 'number') return String(value);
+  const trimmed = value.trim();
+  return trimmed ? trimmed : '—';
+}
+
 /** Badge colours per real lead_status value coming from the database. */
 export const leadStatusClasses: Record<string, string> = {
   new: 'bg-yellow-100 text-yellow-800',

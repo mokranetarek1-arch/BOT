@@ -195,3 +195,42 @@ export interface Message {
   created_at: string;
 }
 
+// ---------------------------------------------------------------------------
+// Dynamic Custom CRM Engine — public.crm_custom_fields / contact_custom_values
+// ---------------------------------------------------------------------------
+
+/** Allowed values of crm_custom_fields.field_type (mirrors the DB CHECK). */
+export type CustomFieldType = 'text' | 'number' | 'select' | 'phone' | 'date';
+
+/**
+ * One custom CRM column definition — a row of public.crm_custom_fields.
+ * `field_name` is the JSONB key inside contact_custom_values.values and must
+ * be a lowercase identifier; `field_label` is the human-facing column title;
+ * `description_for_ai` tells the extractor what the field means.
+ */
+export interface CrmCustomField {
+  id: string;
+  organization_id: string;
+  field_name: string;
+  field_label: string;
+  field_type: CustomFieldType;
+  /** Choices for 'select' fields; null for every other type (DB CHECK). */
+  options: string[] | null;
+  description_for_ai: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+/** Dynamic values object stored in contact_custom_values.values (JSONB). */
+export type ContactCustomValues = Record<string, string | number | null>;
+
+/** One row of public.contact_custom_values — unique per contact (DB UNIQUE). */
+export interface ContactCustomValuesRow {
+  id: string;
+  contact_id: string;
+  organization_id: string;
+  values: ContactCustomValues;
+  created_at: string;
+  updated_at: string;
+}
+

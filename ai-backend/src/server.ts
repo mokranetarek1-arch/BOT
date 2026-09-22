@@ -17,6 +17,8 @@ import {
   getPromptVersion,
   normalizeLeadAnalysis,
   parseModelJson,
+  sanitizeCustomSchema,
+  CustomSchemaError,
   GeminiSafeParseError,
 } from './analyzeLead';
 
@@ -70,12 +72,12 @@ app.post('/ai/test', async (_req: Request, res: Response) => {
 // ---------------------------------------------------------------------------
 // POST /ai/analyze-lead — lead analysis for the CRM smart pipeline.
 //
-// Body: { message_text, contact_id, organization_id }
+// Body: { message_text, contact_id, organization_id, custom_schema? }
 // contact_id / organization_id are validated and echoed back for correlation
-// but never sent to Gemini (only message_text is analyzed).
+// but never sent to Gemini (only message_text + the custom schema are).
 // Returns: { success, model, prompt_version, contact_id, organization_id, data }
 // where data = { client_name, phone_number, intent, product_or_service,
-//                lead_score, summary, suggested_reply } (JSON only).
+//                lead_score, summary, suggested_reply, custom_values } (JSON only).
 // ---------------------------------------------------------------------------
 app.post('/ai/analyze-lead', async (req: Request, res: Response) => {
   const apiKey = process.env.GEMINI_API_KEY;
@@ -105,16 +107,28 @@ app.post('/ai/analyze-lead', async (req: Request, res: Response) => {
     });
   }
 
+  // Optional Dynamic Custom CRM schema — validated and normalized before it
+  // reaches the prompt; invalid payloads are rejected with 400.
+  let customSchema = null;
+  try {
+    customSchema = sanitizeCustomSchema(body.custom_schema);
+  } catch (err) {
+    if (err instanceof CustomSchemaError) {
+      return res.status(400).json({ success: false, error: err.message });
+    }
+    throw err;
+  }
+
   try {
     const text = await callGemini({
       apiKey,
       model: GEMINI_MODEL,
-      prompt: buildLeadPrompt(messageText),
+      prompt: buildLeadPrompt(messageText, customSchema),
       generationConfig: LEAD_GENERATION_CONFIG,
     });
 
     // Invalid/unexpected model output => 502 upstream error.
-    const data = normalizeLeadAnalysis(parseModelJson(text));
+    const data = normalizeLeadAnalysis(parseModelJson(text), customSchema);
 
     return res.status(200).json({
       success: true,

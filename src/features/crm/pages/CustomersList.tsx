@@ -2,14 +2,21 @@ import { useEffect, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { Card, CardContent } from "@/components/ui/card";
 import { contactService } from '@/services/contactService';
-import { Contact } from '@/types';
-import { customerStatusClasses, formatDate, formatLocation } from '../crmFormat';
+import { insightService } from '@/services/insightService';
+import { organizationService } from '@/services/organizationService';
+import { Contact, ContactCustomValues, CrmCustomField } from '@/types';
+import { customerStatusClasses, formatCustomValue, formatDate, formatLocation } from '../crmFormat';
 
 export default function CustomersList() {
   const navigate = useNavigate();
   const [customers, setCustomers] = useState<Contact[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+
+  // Dynamic Custom CRM columns: the org's field definitions plus every
+  // contact's extracted values, keyed by contact_id.
+  const [customFields, setCustomFields] = useState<CrmCustomField[]>([]);
+  const [valuesByContact, setValuesByContact] = useState<Record<string, ContactCustomValues>>({});
 
   // Initial load (same pattern as Inbox): every setState lives in the promise
   // chain, nothing runs synchronously inside the effect body.
@@ -33,6 +40,32 @@ export default function CustomersList() {
     };
   }, []);
 
+  // Custom columns load — a failure here degrades gracefully to the default
+  // table (the page still renders with Name/Location/Status/Added/Actions).
+  useEffect(() => {
+    let cancelled = false;
+    organizationService
+      .getCurrentOrganizationId()
+      .then(async (orgId) => {
+        const [fields, valuesMap] = await Promise.all([
+          insightService.listCustomFields(orgId),
+          insightService.listContactCustomValues(orgId),
+        ]);
+        if (!cancelled) {
+          setCustomFields(fields);
+          setValuesByContact(valuesMap);
+        }
+      })
+      .catch(() => {
+        // Non-fatal: the dynamic columns simply stay empty.
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  const columnCount = 5 + customFields.length;
+
   return (
     <div className="p-6">
       <div className="flex justify-between items-center mb-6">
@@ -50,13 +83,18 @@ export default function CustomersList() {
                   <th className="px-6 py-4">Location</th>
                   <th className="px-6 py-4">Status</th>
                   <th className="px-6 py-4">Added</th>
+                  {customFields.map((field) => (
+                    <th key={field.id} className="px-6 py-4">
+                      {field.field_label}
+                    </th>
+                  ))}
                   <th className="px-6 py-4">Actions</th>
                 </tr>
               </thead>
               <tbody className="divide-y">
                 {loading && (
                   <tr className="bg-card">
-                    <td className="px-6 py-6 text-muted-foreground" colSpan={5}>
+                    <td className="px-6 py-6 text-muted-foreground" colSpan={columnCount}>
                       Loading customers…
                     </td>
                   </tr>
@@ -64,7 +102,7 @@ export default function CustomersList() {
 
                 {!loading && error && (
                   <tr className="bg-card">
-                    <td className="px-6 py-6 text-destructive" colSpan={5}>
+                    <td className="px-6 py-6 text-destructive" colSpan={columnCount}>
                       {error}
                     </td>
                   </tr>
@@ -72,7 +110,7 @@ export default function CustomersList() {
 
                 {!loading && !error && customers.length === 0 && (
                   <tr className="bg-card">
-                    <td className="px-6 py-6 text-muted-foreground" colSpan={5}>
+                    <td className="px-6 py-6 text-muted-foreground" colSpan={columnCount}>
                       No customers yet.
                     </td>
                   </tr>
@@ -99,6 +137,13 @@ export default function CustomersList() {
                       <td className="px-6 py-4 text-muted-foreground">
                         {formatDate(customer.created_at)}
                       </td>
+                      {customFields.map((field) => (
+                        <td key={field.id} className="px-6 py-4">
+                          {formatCustomValue(
+                            valuesByContact[customer.id]?.[field.field_name],
+                          )}
+                        </td>
+                      ))}
                       <td className="px-6 py-4">
                         <button
                           onClick={() => navigate(`/crm/contacts/${customer.id}`)}

@@ -1,21 +1,26 @@
 import { supabase } from '@/utils/supabase';
-import type { ContactInsight, InsightType } from '@/types';
+import type {
+  ContactCustomValues,
+  ContactInsight,
+  CrmCustomField,
+  CustomFieldType,
+  InsightType,
+} from '@/types';
 
 /**
- * Access to AI inferences (public.contact_ai_insights).
+ * Access to AI inferences (public.contact_ai_insights) and to the Dynamic
+ * Custom CRM Engine tables (public.crm_custom_fields / contact_custom_values).
  *
  * Reads are scoped by RLS to the signed-in user's organization — a company can
- * only ever see its own insights. No mock data, no service role, explicit
- * column lists only.
+ * only ever see its own data. No mock data, no service role, explicit column
+ * lists only.
  *
- * Writes happen only through analyzeContactLead(): the frontend calls the AI
- * backend (Render) which returns the structured analysis, and the result is
- * persisted as three insight rows. Row shapes respect the DB CHECK constraint
- * on insight_type:
- *   - 'intent'    ← { intent }
- *   - 'interests' ← { product_or_service } (only when present)
- *   - 'summary'   ← { client_name, phone_number, lead_score, summary,
- *                     suggested_reply }  (full lead analysis)
+ * Writes happen through analyzeContactLead() (AI backend → insights rows →
+ * contact_custom_values) and through the Custom Fields Builder (crm_custom_fields).
+ * Row shapes respect the DB CHECK constraints:
+ *   - contact_ai_insights.insight_type: intent | interests | summary
+ *   - crm_custom_fields.field_type: text | number | select | phone | date
+ *   - select fields require a non-empty options array; others require NULL.
  */
 
 /** Explicit column list — never `select('*')`. */
@@ -35,6 +40,26 @@ export interface LeadAnalysisData {
   lead_score: number | null;
   summary: string | null;
   suggested_reply: string | null;
+  /** Extracted values for the organization's custom fields (null = none). */
+  custom_values: ContactCustomValues | null;
+}
+
+/** Payload shape for one custom field sent to the AI backend. */
+export interface CustomSchemaFieldInput {
+  field_name: string;
+  field_label: string;
+  field_type: CustomFieldType;
+  description_for_ai?: string | null;
+  options?: string[] | null;
+}
+
+/** Payload for creating/updating a custom field (mirrors the DB CHECK). */
+export interface CustomFieldInput {
+  field_name: string;
+  field_label: string;
+  field_type: CustomFieldType;
+  description_for_ai?: string | null;
+  options?: string[] | null;
 }
 
 interface AnalyzeLeadResponse {
@@ -96,6 +121,85 @@ async function upsertInsightRow(params: {
   if (error) throw new Error(error.message);
 }
 
+/** Client-side validation mirroring the crm_custom_fields DB CHECKs. */
+const FIELD_NAME_RE = /^[a-z0-9_]+$/;
+const ALLOWED_FIELD_TYPES = new Set<CustomFieldType>([
+  'text',
+  'number',
+  'select',
+  'phone',
+  'date',
+]);
+
+function normalizeFieldInput(
+  input: CustomFieldInput,
+): {
+  field_name: string;
+  field_label: string;
+  field_type: CustomFieldType;
+  options: string[] | null;
+  description_for_ai: string | null;
+} {
+  const field_name = input.field_name.trim().toLowerCase();
+  const field_label = input.field_label.trim();
+  const field_type = input.field_type;
+
+  if (!field_name || !FIELD_NAME_RE.test(field_name)) {
+    throw new Error('Field name must be lowercase letters, digits and underscores only.');
+  }
+  if (!field_label) throw new Error('Field label is required.');
+  if (!ALLOWED_FIELD_TYPES.has(field_type)) throw new Error('Invalid field type.');
+
+  let options: string[] | null = null;
+  if (field_type === 'select') {
+    const parsed = (input.options ?? [])
+      .map((opt) => opt.trim())
+      .filter((opt) => opt.length > 0);
+    if (parsed.length === 0) {
+      throw new Error('Select fields need at least one option (comma separated).');
+    }
+    options = parsed;
+  }
+
+  const description = input.description_for_ai?.trim() || null;
+  return { field_name, field_label, field_type, options, description_for_ai: description };
+}
+
+/** Insert-or-update the single custom values row of a contact (UNIQUE contact_id). */
+async function upsertContactCustomValues(
+  organizationId: string,
+  contactId: string,
+  values: ContactCustomValues,
+): Promise<void> {
+  const { error } = await supabase.from('contact_custom_values').upsert(
+    {
+      contact_id: contactId,
+      organization_id: organizationId,
+      values,
+    },
+    { onConflict: 'contact_id' },
+  );
+  if (error) throw new Error(error.message);
+}
+
+/** Defensive parse of the model-returned custom_values object. */
+function parseCustomValues(raw: unknown): ContactCustomValues | null {
+  if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) return null;
+  const source = raw as Record<string, unknown>;
+  const out: ContactCustomValues = {};
+  for (const [key, value] of Object.entries(source)) {
+    if (!key.trim()) continue;
+    if (typeof value === 'number' && Number.isFinite(value)) {
+      out[key] = value;
+    } else if (typeof value === 'string' && value.trim()) {
+      out[key] = value.trim();
+    } else {
+      out[key] = null;
+    }
+  }
+  return Object.keys(out).length > 0 ? out : null;
+}
+
 export const insightService = {
   /**
    * All insights of one contact, newest first.
@@ -127,8 +231,10 @@ export const insightService = {
     contactId: string;
     organizationId: string;
     messageText: string;
+    /** Dynamic Custom CRM fields the AI should also extract. */
+    customSchema?: CustomSchemaFieldInput[];
   }): Promise<LeadAnalysisData> {
-    const { contactId, organizationId, messageText } = params;
+    const { contactId, organizationId, messageText, customSchema } = params;
 
     const baseUrl = import.meta.env.VITE_AI_BACKEND_URL;
     if (!baseUrl) {
@@ -149,6 +255,7 @@ export const insightService = {
           message_text: messageText,
           contact_id: contactId,
           organization_id: organizationId,
+          custom_schema: customSchema ?? [],
         }),
         signal: controller.signal,
       });
@@ -179,6 +286,7 @@ export const insightService = {
         typeof d.lead_score === 'number' && Number.isFinite(d.lead_score) ? d.lead_score : null,
       summary: typeof d.summary === 'string' ? d.summary : null,
       suggested_reply: typeof d.suggested_reply === 'string' ? d.suggested_reply : null,
+      custom_values: parseCustomValues(d.custom_values),
     };
 
     // 3. Persist — three rows keyed on (org, contact, type, prompt_version).
@@ -221,6 +329,105 @@ export const insightService = {
       promptVersion,
     });
 
+    // 4. Dynamic Custom CRM — persist extracted custom values when present.
+    if (analysis.custom_values && Object.keys(analysis.custom_values).length > 0) {
+      await upsertContactCustomValues(organizationId, contactId, analysis.custom_values);
+    }
+
     return analysis;
+  },
+
+  // -------------------------------------------------------------------------
+  // Dynamic Custom CRM Engine — crm_custom_fields (column definitions)
+  // -------------------------------------------------------------------------
+
+  /** All custom CRM columns of the organization, oldest first (stable order). */
+  async listCustomFields(organizationId: string): Promise<CrmCustomField[]> {
+    const { data, error } = await supabase
+      .from('crm_custom_fields')
+      .select(
+        'id, organization_id, field_name, field_label, field_type, options, description_for_ai, created_at, updated_at',
+      )
+      .eq('organization_id', organizationId)
+      .order('created_at', { ascending: true });
+
+    if (error) throw new Error(error.message);
+    return (data ?? []) as unknown as CrmCustomField[];
+  },
+
+  /** Create one custom CRM column for the organization. */
+  async createCustomField(
+    organizationId: string,
+    input: CustomFieldInput,
+  ): Promise<CrmCustomField> {
+    const normalized = normalizeFieldInput(input);
+    const { data, error } = await supabase
+      .from('crm_custom_fields')
+      .insert({ organization_id: organizationId, ...normalized })
+      .select(
+        'id, organization_id, field_name, field_label, field_type, options, description_for_ai, created_at, updated_at',
+      )
+      .single();
+    if (error) throw new Error(error.message);
+    return data as unknown as CrmCustomField;
+  },
+
+  /** Update an existing custom CRM column (label / type / options / hint). */
+  async updateCustomField(fieldId: string, input: CustomFieldInput): Promise<void> {
+    const normalized = normalizeFieldInput(input);
+    const { error } = await supabase
+      .from('crm_custom_fields')
+      .update(normalized)
+      .eq('id', fieldId);
+    if (error) throw new Error(error.message);
+  },
+
+  /** Delete a custom CRM column. Stored values keep their JSON keys but the
+      column simply disappears from the dynamic table. */
+  async deleteCustomField(fieldId: string): Promise<void> {
+    const { error } = await supabase.from('crm_custom_fields').delete().eq('id', fieldId);
+    if (error) throw new Error(error.message);
+  },
+
+  // -------------------------------------------------------------------------
+  // Dynamic Custom CRM Engine — contact_custom_values (per-contact values)
+  // -------------------------------------------------------------------------
+
+  /** The custom values object of one contact, or null when none exist yet. */
+  async getContactCustomValues(contactId: string): Promise<ContactCustomValues | null> {
+    const { data, error } = await supabase
+      .from('contact_custom_values')
+      .select('contact_id, values')
+      .eq('contact_id', contactId)
+      .maybeSingle();
+
+    if (error) throw new Error(error.message);
+    if (!data) return null;
+    const values = (data as { values?: unknown }).values;
+    return typeof values === 'object' && values !== null && !Array.isArray(values)
+      ? (values as ContactCustomValues)
+      : null;
+  },
+
+  /**
+   * Custom values for every contact of the organization, keyed by contact_id —
+   * the shape the dynamic customers table needs (one fetch for all rows).
+   */
+  async listContactCustomValues(
+    organizationId: string,
+  ): Promise<Record<string, ContactCustomValues>> {
+    const { data, error } = await supabase
+      .from('contact_custom_values')
+      .select('contact_id, values')
+      .eq('organization_id', organizationId);
+
+    if (error) throw new Error(error.message);
+    const map: Record<string, ContactCustomValues> = {};
+    for (const row of (data ?? []) as Array<{ contact_id: string; values: unknown }>) {
+      if (typeof row.values === 'object' && row.values !== null && !Array.isArray(row.values)) {
+        map[row.contact_id] = row.values as ContactCustomValues;
+      }
+    }
+    return map;
   },
 };
