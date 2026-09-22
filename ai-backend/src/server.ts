@@ -225,7 +225,12 @@ app.use((_req: Request, res: Response) => {
 });
 
 app.use((err: unknown, _req: Request, res: Response, _next: unknown) => {
-  void err; // never echo raw error details (may contain env/request data)
+  // Malformed JSON bodies are client errors, not server failures.
+  if (err instanceof SyntaxError) {
+    res.status(400).json({ success: false, error: 'Invalid JSON body.' });
+    return;
+  }
+  // never echo raw error details (may contain env/request data)
   res.status(500).json({ success: false, error: 'Internal server error.' });
 });
 
