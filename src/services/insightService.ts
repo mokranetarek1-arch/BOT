@@ -200,6 +200,15 @@ function parseCustomValues(raw: unknown): ContactCustomValues | null {
   return Object.keys(out).length > 0 ? out : null;
 }
 
+/**
+ * Public base URL of the AI backend (Render). It is NOT a secret, so a
+ * built-in fallback keeps /ai/analyze-lead working even when the frontend was
+ * built without the VITE_AI_BACKEND_URL environment variable (e.g. a Vercel
+ * build made before the variable was configured). An explicitly configured
+ * env var always wins over this fallback.
+ */
+const AI_BACKEND_FALLBACK_URL = 'https://botd-ai-backend.onrender.com';
+
 export const insightService = {
   /**
    * All insights of one contact, newest first.
@@ -220,9 +229,11 @@ export const insightService = {
    * Analyze one customer message through the AI backend and persist the
    * result as contact-level insights.
    *
-   * 1. POST {VITE_AI_BACKEND_URL}/ai/analyze-lead
+   * 1. POST {VITE_AI_BACKEND_URL}/ai/analyze-lead (falls back to the built-in
+   *    Render URL when the env var is missing)
    * 2. Validate the structured response
    * 3. Upsert intent / interests / summary rows in contact_ai_insights
+   * 4. Persist custom_values into contact_custom_values when present
    *
    * Throws with a user-safe message on any failure — no API keys and no raw
    * backend payloads are ever exposed.
@@ -236,10 +247,7 @@ export const insightService = {
   }): Promise<LeadAnalysisData> {
     const { contactId, organizationId, messageText, customSchema } = params;
 
-    const baseUrl = import.meta.env.VITE_AI_BACKEND_URL;
-    if (!baseUrl) {
-      throw new Error('AI backend URL is not configured (VITE_AI_BACKEND_URL).');
-    }
+    const baseUrl = import.meta.env.VITE_AI_BACKEND_URL || AI_BACKEND_FALLBACK_URL;
 
     // 1. Call the AI backend. 30s ceiling so the UI never hangs on Render
     //    cold starts combined with Gemini latency.
