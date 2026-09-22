@@ -24,6 +24,47 @@ import {
 } from './analyzeLead';
 
 const app = express();
+
+// ---------------------------------------------------------------------------
+// CORS — the frontend (Vercel or localhost) calls this API from a DIFFERENT
+// origin, so the browser first sends an OPTIONS preflight and refuses the
+// whole request with a bare "Failed to fetch" unless this API answers with the
+// Access-Control-* headers. Implemented by hand to keep the dependency list
+// minimal.
+//
+// ALLOWED_ORIGINS (comma separated) restricts browsers when set; when unset any
+// origin is allowed — this API is public and carries no browser credentials.
+// ---------------------------------------------------------------------------
+const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS ?? '')
+  .split(',')
+  .map((origin) => origin.trim())
+  .filter(Boolean);
+
+app.use((req: Request, res: Response, next: () => void) => {
+  const origin = req.header('origin');
+  const allowOrigin =
+    ALLOWED_ORIGINS.length === 0
+      ? '*'
+      : origin && ALLOWED_ORIGINS.includes(origin)
+        ? origin
+        : null;
+
+  if (allowOrigin) {
+    res.header('Access-Control-Allow-Origin', allowOrigin);
+    res.header('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
+    res.header('Access-Control-Allow-Headers', 'Content-Type, x-webhook-secret');
+    res.header('Access-Control-Max-Age', '86400');
+  }
+  res.header('Vary', 'Origin');
+
+  // Preflight: answer immediately, never reach the routes.
+  if (req.method === 'OPTIONS') {
+    res.status(allowOrigin ? 204 : 403).end();
+    return;
+  }
+  next();
+});
+
 app.use(express.json({ limit: '64kb' }));
 
 // ---------------------------------------------------------------------------

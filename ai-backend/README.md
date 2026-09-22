@@ -46,6 +46,7 @@ The server listens on `0.0.0.0` and uses `process.env.PORT || 3000`.
 | `SUPABASE_URL` | Yes (automatic pipeline) | Supabase project URL — service-role DB access |
 | `SUPABASE_SERVICE_ROLE_KEY` | Yes (automatic pipeline) | Bypasses RLS so the pipeline can write insights/values/contacts |
 | `WEBHOOK_SECRET` | No | Optional shared secret for `/ai/webhook/message` (`x-webhook-secret` header) |
+| `ALLOWED_ORIGINS` | No | Comma-separated browser origins allowed by CORS. Empty = any origin (the API is public and credential-less). |
 | `PORT` | No | HTTP port (defaults to 3000) |
 
 Secrets are read from the environment only — never hardcoded, logged, or
