@@ -1,22 +1,16 @@
 import { useEffect, useState } from 'react';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
-import { insightService, type CustomFieldInput } from '@/services/insightService';
+import { crmFieldService, type CustomFieldInput } from '@/services/crmFieldService';
 import { organizationService } from '@/services/organizationService';
 import type { CrmCustomField, CustomFieldType } from '@/types';
 
 /**
- * AI Configuration — CRM Columns Mode + Custom Fields Builder.
+ * AI Configuration — the CRM field builder.
  *
- * Auto AI Mode: the AI decides what to extract from each conversation.
- * Custom Manual Mode: the organization defines its own columns here and the
- * AI extracts exactly these fields into the Dynamic Custom CRM Engine
- * (crm_custom_fields / contact_custom_values).
- *
- * The mode choice is remembered per organization in localStorage — it is a
- * client-side preference only (no DB column needed).
+ * This is the only place where the CRM schema is defined: every field listed
+ * here (crm_custom_fields) becomes a column of the CRM tables and a target of
+ * the AI extraction. The AI never invents fields — it only fills these.
  */
-
-type CrmMode = 'auto' | 'custom';
 
 const FIELD_TYPES: { value: CustomFieldType; label: string }[] = [
   { value: 'text', label: 'Text' },
@@ -38,7 +32,6 @@ const EMPTY_DRAFT = {
 
 export default function AISettings() {
   const [orgId, setOrgId] = useState<string | null>(null);
-  const [mode, setMode] = useState<CrmMode>('auto');
   const [fields, setFields] = useState<CrmCustomField[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -47,7 +40,7 @@ export default function AISettings() {
   const [editingId, setEditingId] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
 
-  // Organization + custom fields + remembered mode (initial load only).
+  // Organization + the organization's CRM fields (initial load only).
   useEffect(() => {
     let cancelled = false;
     organizationService
@@ -55,9 +48,7 @@ export default function AISettings() {
       .then(async (resolvedOrgId) => {
         if (cancelled) return;
         setOrgId(resolvedOrgId);
-        const stored = window.localStorage.getItem(`botd.crm_mode.${resolvedOrgId}`);
-        if (stored === 'auto' || stored === 'custom') setMode(stored);
-        const list = await insightService.listCustomFields(resolvedOrgId);
+        const list = await crmFieldService.listCustomFields(resolvedOrgId);
         if (!cancelled) setFields(list);
       })
       .catch((err) => {
@@ -72,12 +63,6 @@ export default function AISettings() {
       cancelled = true;
     };
   }, []);
-
-  const switchMode = (next: CrmMode) => {
-    setMode(next);
-    setNotice(null);
-    if (orgId) window.localStorage.setItem(`botd.crm_mode.${orgId}`, next);
-  };
 
   const startEdit = (field: CrmCustomField) => {
     setEditingId(field.id);
@@ -122,7 +107,7 @@ export default function AISettings() {
       };
       setSaving(true);
       if (editingId) {
-        await insightService.updateCustomField(editingId, input);
+        await crmFieldService.updateCustomField(editingId, input);
         setFields((prev) =>
           prev.map((field) =>
             field.id === editingId
@@ -139,7 +124,7 @@ export default function AISettings() {
         );
         setNotice('Field updated.');
       } else {
-        const created = await insightService.createCustomField(orgId, input);
+        const created = await crmFieldService.createCustomField(orgId, input);
         setFields((prev) => [...prev, created]);
         setNotice(`Field "${created.field_label}" added.`);
       }
@@ -157,7 +142,7 @@ export default function AISettings() {
     setNotice(null);
     try {
       setSaving(true);
-      await insightService.deleteCustomField(field.id);
+      await crmFieldService.deleteCustomField(field.id);
       setFields((prev) => prev.filter((item) => item.id !== field.id));
       if (editingId === field.id) resetDraft();
       setNotice(`Field "${field.field_label}" deleted.`);
@@ -177,52 +162,9 @@ export default function AISettings() {
       {error && <p className="text-sm text-destructive mb-4">{error}</p>}
       {notice && <p className="text-sm text-green-600 mb-4">{notice}</p>}
 
-      <Card className="mb-6">
-        <CardHeader>
-          <CardTitle>CRM Columns Mode</CardTitle>
-        </CardHeader>
-        <CardContent className="space-y-4">
-          <p className="text-sm text-muted-foreground">
-            Choose how your CRM table columns are defined and what the AI extracts from
-            conversations.
-          </p>
-          <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-            <button
-              type="button"
-              onClick={() => switchMode('auto')}
-              className={`text-left border rounded-lg p-4 transition ${
-                mode === 'auto'
-                  ? 'border-primary ring-1 ring-primary bg-primary/5'
-                  : 'border-input hover:bg-muted/50'
-              }`}
-            >
-              <p className="font-semibold">🤖 Auto AI Mode</p>
-              <p className="text-xs text-muted-foreground mt-1">
-                The AI decides which data to extract based on the business domain.
-              </p>
-            </button>
-            <button
-              type="button"
-              onClick={() => switchMode('custom')}
-              className={`text-left border rounded-lg p-4 transition ${
-                mode === 'custom'
-                  ? 'border-primary ring-1 ring-primary bg-primary/5'
-                  : 'border-input hover:bg-muted/50'
-              }`}
-            >
-              <p className="font-semibold">🛠️ Custom Manual Mode</p>
-              <p className="text-xs text-muted-foreground mt-1">
-                You define the columns; the AI extracts exactly these fields from every
-                conversation.
-              </p>
-            </button>
-          </div>
-        </CardContent>
-      </Card>
-
       {loading && <p className="text-sm text-muted-foreground">Loading settings…</p>}
 
-      {!loading && mode === 'custom' && (
+      {!loading && (
         <Card>
           <CardHeader>
             <CardTitle>Custom Fields Builder</CardTitle>
@@ -376,7 +318,7 @@ export default function AISettings() {
         </Card>
       )}
 
-      {!loading && mode === 'auto' && (
+      {!loading && (
         <Card>
           <CardHeader>
             <CardTitle>Brand Voice</CardTitle>

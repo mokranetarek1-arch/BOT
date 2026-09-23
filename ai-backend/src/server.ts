@@ -12,16 +12,17 @@ import { GEMINI_MODEL } from './config';
 import { callGemini, GeminiError } from './gemini';
 import { processInboundMessage } from './pipeline';
 import {
-  MAX_MESSAGE_LENGTH,
-  LEAD_GENERATION_CONFIG,
-  buildLeadPrompt,
+  buildCrmSchema,
+  buildExtractionPrompt,
+  EXTRACTION_GENERATION_CONFIG,
   getPromptVersion,
-  normalizeLeadAnalysis,
+  normalizeCrmFieldUpdates,
   parseModelJson,
-  sanitizeCustomSchema,
-  CustomSchemaError,
-  GeminiSafeParseError,
-} from './analyzeLead';
+  sanitizeCrmFields,
+  sanitizeMessages,
+  CrmSchemaError,
+  CrmExtractionError,
+} from './extractCrmFields';
 
 const app = express();
 
@@ -112,16 +113,23 @@ app.post('/ai/test', async (_req: Request, res: Response) => {
 });
 
 // ---------------------------------------------------------------------------
-// POST /ai/analyze-lead — lead analysis for the CRM smart pipeline.
+// POST /ai/extract-crm-fields — manual CRM field extraction (fallback/debug).
 //
-// Body: { message_text, contact_id, organization_id, custom_schema? }
-// contact_id / organization_id are validated and echoed back for correlation
-// but never sent to Gemini (only message_text + the custom schema are).
-// Returns: { success, model, prompt_version, contact_id, organization_id, data }
-// where data = { client_name, phone_number, intent, product_or_service,
-//                lead_score, summary, suggested_reply, custom_values } (JSON only).
+// Body: {
+//   organization_id, contact_id,
+//   crm_fields: [ { field_name, field_label, field_type, options?,
+//                   description_for_ai?, target?: 'contact'|'custom' } ],
+//   messages:   [ { id, direction: 'inbound'|'outbound', text } ]
+// }
+//
+// Pure extraction: this route never touches the database. The caller (the CRM
+// frontend, or bright-worker for a re-run) owns persistence through RLS.
+//
+// Returns: { success, model, prompt_version, contact_id, organization_id,
+//            crm_fields_used, updates: [ { field, value, confidence,
+//                                         evidence_message_id } ] }
 // ---------------------------------------------------------------------------
-app.post('/ai/analyze-lead', async (req: Request, res: Response) => {
+app.post('/ai/extract-crm-fields', async (req: Request, res: Response) => {
   const apiKey = process.env.GEMINI_API_KEY;
   if (!apiKey) {
     return res.status(500).json({
@@ -131,46 +139,33 @@ app.post('/ai/analyze-lead', async (req: Request, res: Response) => {
   }
 
   const body = (req.body ?? {}) as Record<string, unknown>;
-  const messageText = typeof body.message_text === 'string' ? body.message_text.trim() : '';
   const contactId = typeof body.contact_id === 'string' ? body.contact_id.trim() : '';
   const organizationId =
     typeof body.organization_id === 'string' ? body.organization_id.trim() : '';
 
-  if (!messageText || !contactId || !organizationId) {
+  if (!contactId || !organizationId) {
     return res.status(400).json({
       success: false,
-      error: 'message_text, contact_id and organization_id are required strings.',
-    });
-  }
-  if (messageText.length > MAX_MESSAGE_LENGTH) {
-    return res.status(400).json({
-      success: false,
-      error: `message_text exceeds the maximum length of ${MAX_MESSAGE_LENGTH} characters.`,
+      error: 'contact_id and organization_id are required strings.',
     });
   }
 
-  // Optional Dynamic Custom CRM schema — validated and normalized before it
-  // reaches the prompt; invalid payloads are rejected with 400.
-  let customSchema = null;
+  // CRM schema + conversation messages are validated, sent to Gemini and
+  // normalized inside one block so every failure keeps its own HTTP status.
   try {
-    customSchema = sanitizeCustomSchema(body.custom_schema);
-  } catch (err) {
-    if (err instanceof CustomSchemaError) {
-      return res.status(400).json({ success: false, error: err.message });
-    }
-    throw err;
-  }
+    const fields = buildCrmSchema(sanitizeCrmFields(body.crm_fields));
+    const messages = sanitizeMessages(body.messages);
 
-  try {
     const text = await callGemini({
       apiKey,
       model: GEMINI_MODEL,
-      prompt: buildLeadPrompt(messageText, customSchema),
-      generationConfig: LEAD_GENERATION_CONFIG,
+      prompt: buildExtractionPrompt(fields, messages),
+      generationConfig: EXTRACTION_GENERATION_CONFIG,
     });
 
-    // Invalid/unexpected model output => 502 upstream error.
-    const data = normalizeLeadAnalysis(parseModelJson(text), customSchema);
+    // Invalid/unexpected model output => 502 upstream error. Unsupported
+    // updates are simply dropped by the validator (the CRM field stays as-is).
+    const updates = normalizeCrmFieldUpdates(parseModelJson(text), fields, messages);
 
     return res.status(200).json({
       success: true,
@@ -178,10 +173,14 @@ app.post('/ai/analyze-lead', async (req: Request, res: Response) => {
       prompt_version: getPromptVersion(),
       contact_id: contactId,
       organization_id: organizationId,
-      data,
+      crm_fields_used: fields.length,
+      updates,
     });
   } catch (err) {
-    if (err instanceof GeminiSafeParseError) {
+    if (err instanceof CrmSchemaError) {
+      return res.status(400).json({ success: false, error: err.message });
+    }
+    if (err instanceof CrmExtractionError) {
       return res.status(502).json({ success: false, error: err.message });
     }
     if (err instanceof GeminiError) {
@@ -190,7 +189,7 @@ app.post('/ai/analyze-lead', async (req: Request, res: Response) => {
     }
     return res.status(500).json({
       success: false,
-      error: 'Unexpected server error while analyzing the lead.',
+      error: 'Unexpected server error while extracting CRM fields.',
     });
   }
 });
@@ -199,9 +198,10 @@ app.post('/ai/analyze-lead', async (req: Request, res: Response) => {
 // POST /ai/webhook/message — AUTOMATIC background pipeline trigger.
 //
 // Called by bright-worker (Supabase Edge Function) on every inbound message.
-// The pipeline loads the conversation transcript + the organization's custom
-// CRM fields, runs the Gemini analysis and writes everything server-side:
-// contact_ai_insights + contact_custom_values + conservative contacts update.
+// The pipeline loads the conversation transcript + the organization's CRM
+// schema, extracts the CRM values through Gemini and writes everything
+// server-side: contact_custom_values + the conservative contacts update.
+// (No contact_ai_insights write path — the AI fills CRM fields only.)
 //
 // Auth: optional shared secret — when WEBHOOK_SECRET is set, callers must
 // send it in the `x-webhook-secret` header (bright-worker does).
@@ -244,7 +244,7 @@ app.post('/ai/webhook/message', async (req: Request, res: Response) => {
     });
     return res.status(200).json({ success: true, ...result });
   } catch (err) {
-    if (err instanceof GeminiSafeParseError) {
+    if (err instanceof CrmExtractionError) {
       return res.status(502).json({ success: false, error: err.message });
     }
     if (err instanceof GeminiError) {
@@ -252,7 +252,7 @@ app.post('/ai/webhook/message', async (req: Request, res: Response) => {
       return res.status(status).json({ success: false, error: err.safeMessage });
     }
     // Pipeline errors are safe messages built server-side (no secrets inside).
-    const message = err instanceof Error ? err.message : 'Automatic analysis failed.';
+    const message = err instanceof Error ? err.message : 'Automatic extraction failed.';
     const status = message.includes('not found') ? 404 : 500;
     return res.status(status).json({ success: false, error: message });
   }

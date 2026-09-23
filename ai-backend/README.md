@@ -91,18 +91,28 @@ Error responses:
 | Invalid/unexpected Gemini response| 502         |
 | Gemini request timeout            | 504         |
 
-## 6. Test POST /ai/analyze-lead
+## 6. Test POST /ai/extract-crm-fields
 
-Lead analysis for the CRM smart pipeline. Accepts a customer message and
-returns a structured JSON-only extraction.
+CRM field extraction. The caller sends the CRM schema (the fields the
+organization defined, plus the built-in contact fields) together with the
+conversation messages, and gets back the values the messages explicitly
+provide — each with a confidence and the id of the message it was read from.
 
 ```bash
-curl -X POST http://localhost:3000/ai/analyze-lead \
+curl -X POST http://localhost:3000/ai/extract-crm-fields \
   -H "Content-Type: application/json" \
   -d '{
-    "message_text": "Hi! Im Karim, interested in the leather bag. How much? My number is 0555 123 456",
+    "organization_id": "00000000-0000-0000-0000-000000000000",
     "contact_id": "00000000-0000-0000-0000-000000000000",
-    "organization_id": "00000000-0000-0000-0000-000000000000"
+    "crm_fields": [
+      { "field_name": "wilaya", "field_label": "Wilaya", "field_type": "text", "target": "contact" },
+      { "field_name": "vehicle_wanted", "field_label": "Vehicle wanted", "field_type": "text" },
+      { "field_name": "budget", "field_label": "Budget in DZD", "field_type": "number" },
+      { "field_name": "purchase_timeframe", "field_label": "Purchase timeframe", "field_type": "select", "options": ["This month", "1-3 months", "Later"] }
+    ],
+    "messages": [
+      { "id": "b1f0c6f4-1111-4111-8111-111111111111", "direction": "inbound", "text": "Salam, I want to buy a Peugeot 208, budget 350 million, I am from Algiers and I want it this month." }
+    ]
   }'
 ```
 
@@ -112,65 +122,102 @@ Success response:
 {
   "success": true,
   "model": "gemini-3.5-flash-lite",
-  "prompt_version": "lead-analyzer-v1",
+  "prompt_version": "crm-field-extractor-v1",
   "contact_id": "00000000-0000-0000-0000-000000000000",
   "organization_id": "00000000-0000-0000-0000-000000000000",
-  "data": {
-    "client_name": "Karim",
-    "phone_number": "0555 123 456",
-    "intent": "purchase",
-    "product_or_service": "leather bag",
-    "lead_score": 85,
-    "summary": "Karim asked about the price of the leather bag.",
-    "suggested_reply": "Hi Karim! The leather bag is ... "
-  }
+  "crm_fields_used": 8,
+  "updates": [
+    {
+      "field": "wilaya",
+      "value": "Alger",
+      "confidence": 0.97,
+      "evidence_message_id": "b1f0c6f4-1111-4111-8111-111111111111"
+    },
+    {
+      "field": "vehicle_wanted",
+      "value": "Peugeot 208",
+      "confidence": 0.98,
+      "evidence_message_id": "b1f0c6f4-1111-4111-8111-111111111111"
+    },
+    {
+      "field": "budget",
+      "value": 350000000,
+      "confidence": 0.93,
+      "evidence_message_id": "b1f0c6f4-1111-4111-8111-111111111111"
+    },
+    {
+      "field": "purchase_timeframe",
+      "value": "This month",
+      "confidence": 0.9,
+      "evidence_message_id": "b1f0c6f4-1111-4111-8111-111111111111"
+    }
+  ]
 }
 ```
 
 Notes:
 
+- Pure extraction: this route never touches the database. The caller (the CRM
+  frontend) writes the values through its own RLS-scoped session.
+- `target: "contact"` marks a built-in `contacts` column (name / phone / city /
+  wilaya, only ever filled while empty); a missing/other target means a key in
+  `contact_custom_values`.
+- The schema is merged with the built-in fields server-side, and a custom field
+  with the same name as a built-in one wins.
+- Dropped without an error (the field then simply stays unchanged): unknown
+  field names, values that do not fit the declared type (bad date, select option
+  outside the list), a missing/too low `confidence` (< 0.55), and an
+  `evidence_message_id` that is not one of the supplied messages.
 - `contact_id` / `organization_id` are validated and echoed back for
   correlation — they are never sent to Gemini.
-- The model is forced to JSON-only output (`responseMimeType: application/json`)
-  and every field is validated/normalized server-side before returning.
-- `contact_id` and `organization_id` must be non-empty strings;
-  `message_text` is capped at 8000 characters.
+- The model is forced to JSON-only output (`responseMimeType: application/json`).
 
 | Condition                          | HTTP status |
 |------------------------------------|-------------|
 | Missing `GEMINI_API_KEY`            | 500         |
 | Missing/invalid body fields         | 400         |
+| Invalid `crm_fields` / `messages`   | 400         |
 | Gemini API error                    | Gemini's own status |
 | Non-JSON / unusable model output    | 502         |
 | Gemini request timeout              | 504         |
 
 ## 7. Automatic pipeline: POST /ai/webhook/message
 
-Fully automated background analysis — no user interaction required. Called by
+Fully automated background extraction — no user interaction required. Called by
 `bright-worker` (Supabase Edge Function) right after every inbound message is
 saved, in the background (`EdgeRuntime.waitUntil`) so the Meta webhook is never
 delayed.
 
 What the pipeline does, server-side:
 
-1. Loads the conversation transcript (last 20 messages) and the organization's
-   custom fields from `crm_custom_fields`.
-2. Sends transcript + `custom_schema` to Gemini (same prompt/validation as
-   `/ai/analyze-lead`).
-3. Writes results with the service role:
-   - `contact_ai_insights` → intent / interests / summary rows (upserted)
-   - `contact_custom_values` → extracted custom values, **merged** over
-     previous ones (older values are never lost)
-   - `contacts` → conservative updates only: `name` / `phone` filled when empty
-     or placeholder, `lead_status` only moves forward
-     (`new` → `contacted`, → `qualified` on a purchase intent or lead_score ≥ 70;
-     `won` / `lost` are never touched)
+1. Loads the contact, the conversation transcript (last 30 messages, each with
+   its message id) and the organization's CRM schema: the built-in contact
+   columns (name / phone / city / wilaya) plus every field in `crm_custom_fields`.
+2. Sends the schema + the transcript to Gemini (same prompt/validation as
+   `/ai/extract-crm-fields`).
+3. Writes the accepted updates with the service role:
+   - `contact_custom_values` → organization-defined fields, **merged**: an empty
+     field is filled; a stored value is only replaced by a clearly stated
+     (evidence-backed, confidence ≥ 0.85) value — never weakened, never blanked;
+   - `contacts` → the built-in columns are filled **only** while they are empty
+     or still an ingestion placeholder (`instagram user …`), and `lead_status`
+     only moves forward `new` → `contacted` (`qualified` / `won` / `lost` stay
+     manual).
+4. Writes nothing else. There is **no** `contact_ai_insights` write path: the AI
+   fills the CRM fields the organization defined instead of producing a separate
+   insights layer (intent / interests / sentiment / summary).
 
 Body:
 
 ```json
 { "organization_id": "uuid", "contact_id": "uuid", "conversation_id": "uuid", "message_id": "optional" }
 ```
+
+Response: `{ success, organizationId, contactId, conversationId,
+transcript_messages, crm_fields_used, updates, applied_custom_values,
+applied_contact_fields, skipped_updates, contact_updates, custom_values_written }`
+— `skipped_updates` lists the accepted values that were kept out to protect a
+stored/confirmed value.
 
 Errors: `401` invalid webhook secret, `400` missing fields, `500` missing
 env/secrets, `404` unknown contact, `502`/Gemini status on model errors.

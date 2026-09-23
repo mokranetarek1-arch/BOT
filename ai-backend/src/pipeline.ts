@@ -1,32 +1,46 @@
 /**
- * Automated background pipeline for the AI Lead Analyzer.
+ * Automated background CRM extraction pipeline.
  *
  * Triggered by bright-worker (POST /ai/webhook/message) on every inbound
  * message. Steps:
- *   1. Load the conversation transcript + the organization's custom fields.
- *   2. Analyze through Gemini (same prompt/validation as /ai/analyze-lead).
- *   3. Persist: contact_ai_insights, contact_custom_values (merged) and
- *      conservative contacts updates (fill empty name/phone, upgrade
- *      lead_status — never overwrite confirmed facts, never downgrade).
+ *   1. Load the contact, the conversation transcript (with message ids) and the
+ *      organization's CRM schema (built-in contact columns + crm_custom_fields).
+ *   2. Extract CRM values through Gemini — exactly the same prompt and
+ *      validation as POST /ai/extract-crm-fields.
+ *   3. Persist the accepted updates:
+ *        - public.contact_custom_values → organization-defined CRM fields,
+ *          merged; a stored value is only replaced by a strong, evidence-backed
+ *          restatement (never weakened, never blanked);
+ *        - public.contacts → built-in columns (name/phone/city/wilaya) filled
+ *          only while they are empty or still an ingestion placeholder.
  *
- * All DB access uses the service-role client and never touches the API key.
+ * There is deliberately NO contact_ai_insights write path anymore: the AI fills
+ * the CRM fields the organization defined instead of a separate "insights"
+ * layer with fixed intent/interests/sentiment types.
+ *
+ * All DB access uses the service-role client; the API key never leaves gemini.ts.
  */
 import { getSupabaseAdmin } from './supabaseAdmin';
 import { callGemini } from './gemini';
 import { GEMINI_MODEL } from './config';
 import {
-  buildLeadPrompt,
-  getPromptVersion,
-  LEAD_GENERATION_CONFIG,
-  normalizeLeadAnalysis,
+  buildCrmSchema,
+  buildExtractionPrompt,
+  EXTRACTION_GENERATION_CONFIG,
+  normalizeCrmFieldUpdates,
   parseModelJson,
-  type CustomSchemaField,
-} from './analyzeLead';
+  shouldFillContactField,
+  shouldReplaceStoredValue,
+  type ConversationMessage,
+  type CrmFieldDefinition,
+  type CrmFieldUpdate,
+} from './extractCrmFields';
 
-export const MAX_TRANSCRIPT_MESSAGES = 20;
+/** How many of the most recent messages are sent to the extractor. */
+export const MAX_TRANSCRIPT_MESSAGES = 30;
 
-/** Placeholder names created by bright-worker for brand-new contacts. */
-const PLACEHOLDER_NAME_RE = /^(instagram|facebook) user /i;
+/** Built-in contact columns the extractor may fill (confirmed-data columns). */
+const CONTACT_COLUMNS = ['name', 'phone', 'city', 'wilaya'] as const;
 
 export interface ProcessMessageParams {
   organizationId: string;
@@ -39,30 +53,31 @@ export interface ProcessMessageResult {
   contactId: string;
   conversationId: string;
   transcript_messages: number;
-  custom_fields_used: number;
-  analysis: {
-    client_name: string | null;
-    phone_number: string | null;
-    intent: string | null;
-    product_or_service: string | null;
-    lead_score: number | null;
-    summary: string | null;
-    suggested_reply: string | null;
-    custom_values: Record<string, string | number | null> | null;
-  };
+  crm_fields_used: number;
+  /** Every update the model produced and the validator accepted. */
+  updates: CrmFieldUpdate[];
+  /** Custom CRM keys that were actually written (merged into the jsonb). */
+  applied_custom_values: string[];
+  /** Built-in contact columns that were actually filled. */
+  applied_contact_fields: string[];
+  /** Accepted updates that were skipped to protect a stored value. */
+  skipped_updates: string[];
   contact_updates: string[];
-  insights_written: string[];
   custom_values_written: number;
 }
 
-/** Builds the analyzable transcript from the conversation's recent messages. */
-async function buildTranscript(
+/**
+ * Builds the analyzable transcript from the conversation's recent messages.
+ * Each message keeps its database id because the extractor must cite the
+ * message an extracted value came from.
+ */
+async function loadConversationMessages(
   sb: ReturnType<typeof getSupabaseAdmin>,
   conversationId: string,
-): Promise<string> {
+): Promise<ConversationMessage[]> {
   const { data, error } = await sb
     .from('messages')
-    .select('message_text, direction, message_type')
+    .select('id, message_text, direction, message_type')
     .eq('conversation_id', conversationId)
     .order('created_at', { ascending: true })
     .limit(100);
@@ -71,18 +86,27 @@ async function buildTranscript(
 
   const recent = (data ?? []).slice(-MAX_TRANSCRIPT_MESSAGES);
   return recent
-    .map(
-      (m: { message_text: string | null; direction: string | null; message_type: string }) =>
-        `${m.direction === 'outbound' ? 'Agent' : 'Customer'}: ${m.message_text ?? `[${m.message_type}]`}`,
-    )
-    .join('\n');
+    .map((row: Record<string, unknown>) => {
+      const text =
+        typeof row.message_text === 'string' && row.message_text.trim()
+          ? row.message_text.trim()
+          : `[${String(row.message_type ?? 'message')}]`;
+      return {
+        id: String(row.id),
+        direction: (row.direction === 'outbound' ? 'outbound' : 'inbound') as
+          | 'inbound'
+          | 'outbound',
+        text,
+      };
+    })
+    .filter((message) => message.id && message.text);
 }
 
-/** Loads the organization's custom CRM fields as the Gemini schema. */
-async function loadCustomSchema(
+/** Loads the organization's custom CRM fields as extraction-schema entries. */
+async function loadCustomFields(
   sb: ReturnType<typeof getSupabaseAdmin>,
   organizationId: string,
-): Promise<CustomSchemaField[]> {
+): Promise<CrmFieldDefinition[]> {
   const { data, error } = await sb
     .from('crm_custom_fields')
     .select('field_name, field_label, field_type, options, description_for_ai')
@@ -94,167 +118,132 @@ async function loadCustomSchema(
   return (data ?? []).map((row: Record<string, unknown>) => ({
     field_name: String(row.field_name),
     field_label: String(row.field_label),
-    field_type: String(row.field_type) as CustomSchemaField['field_type'],
+    field_type: String(row.field_type) as CrmFieldDefinition['field_type'],
+    target: 'custom' as const,
     description_for_ai: typeof row.description_for_ai === 'string' ? row.description_for_ai : null,
     options: Array.isArray(row.options) ? row.options.map((opt) => String(opt)) : null,
   }));
 }
 
-/**
- * Insert-or-update one contact-level insight row (conversation_id = NULL).
- * Same key as the frontend writer (org + contact + type + prompt_version).
- */
-async function upsertInsightRow(
+/** The stored custom values object of a contact (empty object when none). */
+async function loadCustomValues(
   sb: ReturnType<typeof getSupabaseAdmin>,
-  params: {
-    organizationId: string;
-    contactId: string;
-    insightType: 'intent' | 'interests' | 'summary';
-    value: Record<string, unknown>;
-    model: string;
-    promptVersion: string;
-  },
-): Promise<'created' | 'updated'> {
-  const { organizationId, contactId, insightType, value, model, promptVersion } = params;
-
-  const { data: existing, error: selectError } = await sb
-    .from('contact_ai_insights')
-    .select('id')
-    .eq('organization_id', organizationId)
-    .eq('contact_id', contactId)
-    .eq('insight_type', insightType)
-    .eq('prompt_version', promptVersion)
-    .is('conversation_id', null)
-    .limit(1)
-    .maybeSingle();
-  if (selectError) throw new Error(`Insight lookup failed: ${selectError.message}`);
-
-  if (existing?.id) {
-    const { error } = await sb
-      .from('contact_ai_insights')
-      .update({ value, model })
-      .eq('id', existing.id);
-    if (error) throw new Error(`Insight update failed: ${error.message}`);
-    return 'updated';
-  }
-
-  const { error } = await sb.from('contact_ai_insights').insert({
-    organization_id: organizationId,
-    contact_id: contactId,
-    conversation_id: null,
-    insight_type: insightType,
-    value,
-    model,
-    prompt_version: promptVersion,
-    source_message_ids: [],
-  });
-  if (error) throw new Error(`Insight insert failed: ${error.message}`);
-  return 'created';
-}
-
-/** Merges the new non-null values over the stored ones (history is kept). */
-async function upsertCustomValues(
-  sb: ReturnType<typeof getSupabaseAdmin>,
-  params: {
-    organizationId: string;
-    contactId: string;
-    values: Record<string, string | number | null>;
-  },
-): Promise<number> {
-  const { organizationId, contactId, values } = params;
-
-  const { data: existingRow } = await sb
+  contactId: string,
+): Promise<Record<string, string | number | null>> {
+  const { data } = await sb
     .from('contact_custom_values')
     .select('values')
     .eq('contact_id', contactId)
     .maybeSingle();
 
-  const stored =
-    typeof existingRow?.values === 'object' && existingRow.values !== null
-      ? (existingRow.values as Record<string, string | number | null>)
-      : {};
+  const values = data?.values;
+  return typeof values === 'object' && values !== null && !Array.isArray(values)
+    ? (values as Record<string, string | number | null>)
+    : {};
+}
+
+/**
+ * Merges accepted updates into the contact's custom values and stores them.
+ * A stored value is protected by shouldReplaceStoredValue; skipped updates are
+ * reported instead of silently dropping data.
+ */
+async function applyCustomValueUpdates(
+  sb: ReturnType<typeof getSupabaseAdmin>,
+  params: {
+    organizationId: string;
+    contactId: string;
+    updates: CrmFieldUpdate[];
+    fields: CrmFieldDefinition[];
+    stored: Record<string, string | number | null>;
+  },
+): Promise<{
+  values: Record<string, string | number | null>;
+  written: string[];
+  skipped: string[];
+}> {
+  const { organizationId, contactId, updates, fields, stored } = params;
+  const customNames = new Set(
+    fields.filter((field) => field.target === 'custom').map((field) => field.field_name),
+  );
 
   const merged: Record<string, string | number | null> = { ...stored };
-  let changed = 0;
-  for (const [key, value] of Object.entries(values)) {
-    if (value !== null && value !== merged[key]) {
-      merged[key] = value;
-      changed += 1;
+  const written: string[] = [];
+  const skipped: string[] = [];
+
+  for (const update of updates) {
+    if (!customNames.has(update.field)) continue;
+    if (shouldReplaceStoredValue(merged[update.field], update)) {
+      merged[update.field] = update.value;
+      written.push(update.field);
+    } else {
+      skipped.push(`${update.field} (kept the stored value)`);
     }
   }
+
+  if (written.length === 0) return { values: merged, written, skipped };
 
   const { error } = await sb.from('contact_custom_values').upsert(
     { contact_id: contactId, organization_id: organizationId, values: merged },
     { onConflict: 'contact_id' },
   );
   if (error) throw new Error(`Custom values upsert failed: ${error.message}`);
-  return changed;
+
+  return { values: merged, written, skipped };
 }
 
 /**
  * Conservative contacts update:
- *  - name / phone are filled ONLY when empty or placeholder — AI inference
- *    never overwrites confirmed facts.
- *  - lead_status only moves forward: new → contacted (analysis happened),
- *    then → qualified on a strong buying signal. won/lost are never touched.
+ *  - the built-in CRM columns (name / phone / city / wilaya) are filled ONLY
+ *    while they are empty or still an ingestion placeholder — an extraction
+ *    never overwrites confirmed data;
+ *  - lead_status only moves forward from 'new' to 'contacted' (the pipeline is
+ *    not a scoring system: qualified / won / lost stay manual).
  * Returns the list of columns that were actually updated.
  */
-async function updateContactFromAnalysis(
+async function applyContactUpdates(
   sb: ReturnType<typeof getSupabaseAdmin>,
   params: {
     contactId: string;
-    clientName: string | null;
-    phoneNumber: string | null;
-    intent: string | null;
-    leadScore: number | null;
+    contact: Record<string, unknown>;
+    updates: CrmFieldUpdate[];
+    fields: CrmFieldDefinition[];
   },
-): Promise<string[]> {
-  const { contactId, clientName, phoneNumber, intent, leadScore } = params;
+): Promise<{ updated: string[]; skipped: string[] }> {
+  const { contactId, contact, updates, fields } = params;
+  const contactFields = fields.filter(
+    (field) =>
+      field.target === 'contact' && (CONTACT_COLUMNS as readonly string[]).includes(field.field_name),
+  );
 
-  const { data: contact, error } = await sb
-    .from('contacts')
-    .select('name, phone, lead_status')
-    .eq('id', contactId)
-    .maybeSingle();
-  if (error) throw new Error(`Contact lookup failed: ${error.message}`);
-  if (!contact) throw new Error('Contact not found.');
+  const changed: Record<string, string> = {};
+  const skipped: string[] = [];
 
-  const updates: Record<string, string> = {};
-  const currentName = typeof contact.name === 'string' ? contact.name.trim() : '';
-  const isPlaceholder =
-    !currentName ||
-    currentName.toLowerCase() === 'unknown' ||
-    PLACEHOLDER_NAME_RE.test(currentName);
+  for (const field of contactFields) {
+    const update = updates.find((entry) => entry.field === field.field_name);
+    if (!update) continue;
 
-  if (clientName && (!currentName || isPlaceholder) && clientName !== currentName) {
-    updates.name = clientName;
-  }
-  const currentPhone = typeof contact.phone === 'string' ? contact.phone.trim() : '';
-  if (phoneNumber && !currentPhone && phoneNumber !== currentPhone) {
-    updates.phone = phoneNumber;
+    const current = contact[field.field_name];
+    if (shouldFillContactField(typeof current === 'string' ? current : null, update)) {
+      changed[field.field_name] = String(update.value);
+    } else {
+      skipped.push(`${field.field_name} (contact column already set)`);
+    }
   }
 
   const currentLeadStatus = String(contact.lead_status ?? 'new');
-  const strongSignal = intent === 'purchase' || (typeof leadScore === 'number' && leadScore >= 70);
-  if (currentLeadStatus === 'new') {
-    updates.lead_status = strongSignal ? 'qualified' : 'contacted';
-  } else if (currentLeadStatus === 'contacted' && strongSignal) {
-    updates.lead_status = 'qualified';
-  }
+  if (currentLeadStatus === 'new') changed.lead_status = 'contacted';
 
-  if (Object.keys(updates).length === 0) return [];
+  if (Object.keys(changed).length === 0) return { updated: [], skipped };
 
-  const { error: updateError } = await sb
-    .from('contacts')
-    .update(updates)
-    .eq('id', contactId);
-  if (updateError) throw new Error(`Contact update failed: ${updateError.message}`);
-  return Object.keys(updates);
+  const { error } = await sb.from('contacts').update(changed).eq('id', contactId);
+  if (error) throw new Error(`Contact update failed: ${error.message}`);
+
+  return { updated: Object.keys(changed), skipped };
 }
 
 /**
- * Full automatic pipeline for one inbound message:
- * transcript + custom schema → Gemini → insights + custom values + contact.
+ * Full automatic extraction pipeline for one inbound message:
+ * transcript + CRM schema → Gemini → CRM fields (custom values + contact).
  */
 export async function processInboundMessage(
   apiKey: string,
@@ -266,113 +255,59 @@ export async function processInboundMessage(
   // 1. Contact must exist and belong to the organization (multi-tenant guard).
   const { data: contact, error: contactError } = await sb
     .from('contacts')
-    .select('id')
+    .select('id, name, phone, city, wilaya, lead_status')
     .eq('id', contactId)
     .eq('organization_id', organizationId)
     .maybeSingle();
+
   if (contactError) throw new Error(`Contact lookup failed: ${contactError.message}`);
   if (!contact) throw new Error('Contact not found for this organization.');
 
-  // 2. Transcript + custom schema.
-  const transcript = await buildTranscript(sb, conversationId);
-  if (!transcript.trim()) {
+  // 2. Transcript (with message ids) + the organization's CRM schema.
+  const messages = await loadConversationMessages(sb, conversationId);
+  if (messages.length === 0) {
     throw new Error('No analyzable messages in this conversation.');
   }
-  const customSchema = await loadCustomSchema(sb, organizationId);
+  const customFields = await loadCustomFields(sb, organizationId);
+  const fields = buildCrmSchema(customFields);
 
-  // 3. Gemini analysis (same prompt/validation as the manual endpoint).
+  // 3. Gemini extraction (same prompt/validation as /ai/extract-crm-fields).
   const text = await callGemini({
     apiKey,
     model: GEMINI_MODEL,
-    prompt: buildLeadPrompt(transcript, customSchema.length > 0 ? customSchema : null),
-    generationConfig: LEAD_GENERATION_CONFIG,
+    prompt: buildExtractionPrompt(fields, messages),
+    generationConfig: EXTRACTION_GENERATION_CONFIG,
   });
-  const analysis = normalizeLeadAnalysis(parseModelJson(text), customSchema);
+  const updates = normalizeCrmFieldUpdates(parseModelJson(text), fields, messages);
 
-  const model = GEMINI_MODEL;
-  const promptVersion = getPromptVersion();
-  const insightsWritten: string[] = [];
-
-  // 4. Insights (intent / interests / summary — same shapes as the frontend).
-  insightsWritten.push(
-    `intent:${await upsertInsightRow(sb, {
-      organizationId,
-      contactId,
-      insightType: 'intent',
-      value: { intent: analysis.intent },
-      model,
-      promptVersion,
-    })}`,
-  );
-
-  if (analysis.product_or_service !== null) {
-    insightsWritten.push(
-      `interests:${await upsertInsightRow(sb, {
-        organizationId,
-        contactId,
-        insightType: 'interests',
-        value: { product_or_service: analysis.product_or_service },
-        model,
-        promptVersion,
-      })}`,
-    );
-  }
-
-  insightsWritten.push(
-    `summary:${await upsertInsightRow(sb, {
-      organizationId,
-      contactId,
-      insightType: 'summary',
-      value: {
-        client_name: analysis.client_name,
-        phone_number: analysis.phone_number,
-        lead_score: analysis.lead_score,
-        summary: analysis.summary,
-        suggested_reply: analysis.suggested_reply,
-      },
-      model,
-      promptVersion,
-    })}`,
-  );
-
-  // 5. Dynamic custom values (merged over previous ones).
-  let customValuesWritten = 0;
-  if (analysis.custom_values && Object.keys(analysis.custom_values).length > 0) {
-    customValuesWritten = await upsertCustomValues(sb, {
-      organizationId,
-      contactId,
-      values: analysis.custom_values,
-    });
-  }
-
-  // 6. Conservative contacts update (name / phone / lead_status).
-  const contactUpdates = await updateContactFromAnalysis(sb, {
+  // 4. Persist — custom CRM fields first, then the built-in contact columns.
+  const stored = await loadCustomValues(sb, contactId);
+  const customResult = await applyCustomValueUpdates(sb, {
+    organizationId,
     contactId,
-    clientName: analysis.client_name,
-    phoneNumber: analysis.phone_number,
-    intent: analysis.intent,
-    leadScore: analysis.lead_score,
+    updates,
+    fields,
+    stored,
+  });
+  const contactResult = await applyContactUpdates(sb, {
+    contactId,
+    contact: contact as unknown as Record<string, unknown>,
+    updates,
+    fields,
   });
 
   return {
     organizationId,
     contactId,
     conversationId,
-    transcript_messages: transcript.split('\n').length,
-    custom_fields_used: customSchema.length,
-    analysis: {
-      client_name: analysis.client_name,
-      phone_number: analysis.phone_number,
-      intent: analysis.intent,
-      product_or_service: analysis.product_or_service,
-      lead_score: analysis.lead_score,
-      summary: analysis.summary,
-      suggested_reply: analysis.suggested_reply,
-      custom_values: analysis.custom_values,
-    },
-    contact_updates: contactUpdates,
-    insights_written: insightsWritten,
-    custom_values_written: customValuesWritten,
+    transcript_messages: messages.length,
+    crm_fields_used: fields.length,
+    updates,
+    applied_custom_values: customResult.written,
+    applied_contact_fields: contactResult.updated.filter((column) => column !== 'lead_status'),
+    skipped_updates: [...customResult.skipped, ...contactResult.skipped],
+    contact_updates: contactResult.updated,
+    custom_values_written: customResult.written.length,
   };
 }
 

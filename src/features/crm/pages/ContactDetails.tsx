@@ -7,12 +7,11 @@ import {
   Contact,
   ContactChannel,
   ContactCustomValues,
-  ContactInsight,
   Conversation,
   CrmCustomField,
   Message,
 } from '@/types';
-import { insightService } from '@/services/insightService';
+import { crmFieldService } from '@/services/crmFieldService';
 import {
   channelBadgeClasses,
   conversationStatusClasses,
@@ -24,31 +23,6 @@ import {
   leadStatusClasses,
   textOrDash,
 } from '../crmFormat';
-
-/** Badge colours per contact_ai_insights.insight_type value. */
-const insightTypeClasses: Record<string, string> = {
-  intent: 'bg-indigo-100 text-indigo-800',
-  interests: 'bg-purple-100 text-purple-800',
-  needs: 'bg-blue-100 text-blue-800',
-  buying_timeframe: 'bg-amber-100 text-amber-800',
-  sentiment: 'bg-teal-100 text-teal-800',
-  summary: 'bg-gray-100 text-gray-800',
-};
-
-/**
- * Render an insight value (arbitrary JSON from a future analyzer) without
- * assuming its shape. Strings print as-is; everything else prints as compact
- * JSON so no data is lost.
- */
-function insightValueText(value: unknown): string {
-  if (typeof value === 'string') return value.trim() ? value : '—';
-  if (value === null || value === undefined) return '—';
-  try {
-    return JSON.stringify(value);
-  } catch {
-    return '—';
-  }
-}
 
 /**
  * Attachment metadata exactly as Meta provides it (type + payload reference).
@@ -79,10 +53,15 @@ function DetailRow({ label, value }: { label: string; value: string }) {
 }
 
 /**
- * Contact details — a real view of public.contacts plus the channel identities
- * and conversations attached to it.
+ * Contact details — a real view of public.contacts, the channel identities and
+ * the conversations attached to it, plus the CRM fields the organization
+ * defined (crm_custom_fields / contact_custom_values).
  *
- * Read-only by design: no edit/delete/create, no status mutation, no AI.
+ * The extracted CRM data is the primary content of this page; the conversations
+ * and messages below it are the supporting source. There is no separate
+ * "AI Insights" section: the AI writes the CRM fields themselves, automatically
+ * on every inbound message (and on demand through the extraction button).
+ *
  * Everything comes from Supabase and is scoped by RLS to the signed-in user's
  * organization, so a contact of another organization is simply "not found".
  */
@@ -100,24 +79,18 @@ export default function ContactDetails() {
   const [conversations, setConversations] = useState<Conversation[]>([]);
   const [conversationsError, setConversationsError] = useState<string | null>(null);
 
-  // AI inferences (contact_ai_insights). Own fetch; setState only runs in
-  // promise callbacks, so no render cascade is possible.
-  const [insights, setInsights] = useState<ContactInsight[]>([]);
-  const [insightsLoading, setInsightsLoading] = useState(true);
-  const [insightsError, setInsightsError] = useState<string | null>(null);
+  // CRM state: the organization's field definitions, this contact's extracted
+  // values and the state of the manual "Extract CRM data with AI" action.
+  const [customFields, setCustomFields] = useState<CrmCustomField[]>([]);
+  const [customValues, setCustomValues] = useState<ContactCustomValues | null>(null);
+  const [extracting, setExtracting] = useState(false);
+  const [extractError, setExtractError] = useState<string | null>(null);
+  const [extractNotice, setExtractNotice] = useState<string | null>(null);
 
   const [selectedConversationId, setSelectedConversationId] = useState<string | null>(null);
   const [messages, setMessages] = useState<Message[]>([]);
   const [messagesLoading, setMessagesLoading] = useState(false);
   const [messagesError, setMessagesError] = useState<string | null>(null);
-
-  // Dynamic Custom CRM Engine: field definitions + this contact's extracted
-  // values + the state of the "Analyze Lead with AI" action.
-  const [customFields, setCustomFields] = useState<CrmCustomField[]>([]);
-  const [customValues, setCustomValues] = useState<ContactCustomValues | null>(null);
-  const [analyzing, setAnalyzing] = useState(false);
-  const [analyzeError, setAnalyzeError] = useState<string | null>(null);
-  const [analyzeNotice, setAnalyzeNotice] = useState<string | null>(null);
 
   // Contact itself. Loaded separately from channels/conversations so a failure
   // in either of those never hides the contact.
@@ -182,40 +155,17 @@ export default function ContactDetails() {
     };
   }, [id]);
 
-  // AI inferences of the contact, read-only. A failure here only fills the
-  // AI Insights card — it never hides the contact, channels, or conversations.
-  useEffect(() => {
-    if (!id) return;
-    let cancelled = false;
-    insightService
-      .listContactInsights(id)
-      .then((list) => {
-        if (!cancelled) setInsights(list);
-      })
-      .catch((err) => {
-        if (!cancelled) {
-          setInsightsError(err instanceof Error ? err.message : 'Could not load insights.');
-        }
-      })
-      .finally(() => {
-        if (!cancelled) setInsightsLoading(false);
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [id]);
-
   // Dynamic Custom CRM: org field definitions + this contact's stored values.
   useEffect(() => {
     if (!id || !contact) return;
     let cancelled = false;
-    insightService
+    crmFieldService
       .listCustomFields(contact.organization_id)
       .then((list) => {
         if (!cancelled) setCustomFields(list);
       })
       .catch(() => {
-        // Non-fatal: the analyze button still works without custom fields.
+        // Non-fatal: the contact still renders without custom columns.
       });
     return () => {
       cancelled = true;
@@ -225,7 +175,7 @@ export default function ContactDetails() {
   useEffect(() => {
     if (!id) return;
     let cancelled = false;
-    insightService
+    crmFieldService
       .getContactCustomValues(id)
       .then((values) => {
         if (!cancelled) setCustomValues(values);
@@ -239,9 +189,9 @@ export default function ContactDetails() {
   }, [id]);
 
   // Silent refresh when the tab becomes visible again: the automatic AI
-  // pipeline writes insights / custom values / contact fields in the
-  // background as messages arrive, so the page stays current without a
-  // manual reload. Failures are ignored (the last rendered data stays).
+  // extraction writes CRM values and contact fields in the background as
+  // messages arrive, so the page stays current without a manual reload.
+  // Failures are ignored (the last rendered data stays).
   useEffect(() => {
     if (!id) return;
     const refresh = () => {
@@ -252,14 +202,7 @@ export default function ContactDetails() {
           if (row) setContact(row);
         })
         .catch(() => {});
-      insightService
-        .listContactInsights(id)
-        .then((list) => {
-          setInsights(list);
-          setInsightsError(null);
-        })
-        .catch(() => {});
-      insightService
+      crmFieldService
         .getContactCustomValues(id)
         .then((values) => setCustomValues(values))
         .catch(() => {});
@@ -302,62 +245,64 @@ export default function ContactDetails() {
     setSelectedConversationId(conversationId);
   };
 
-  /** Joins the most recent messages into one analyzable transcript. */
-  const buildMessageText = (list: Message[]): string =>
-    list
-      .slice(-20)
-      .map(
-        (message) =>
-          `${message.direction === 'outbound' ? 'Agent' : 'Customer'}: ${
-            message.message_text ?? `[${message.message_type}]`
-          }`,
-      )
-      .join('\n');
+  /**
+   * Manual fallback of the automatic extraction: read the contact's most recent
+   * messages, let the AI map them onto the CRM fields and write the result into
+   * the CRM record. A field the conversation does not provide stays unchanged —
+   * the AI only reports values it can back with a specific message.
+   */
+  const handleExtractCrmData = async () => {
+    if (!contact || extracting) return;
+    setExtracting(true);
+    setExtractError(null);
+    setExtractNotice(null);
 
-  const handleAnalyzeLead = async () => {
-    if (!id || !contact || analyzing) return;
-    setAnalyzing(true);
-    setAnalyzeError(null);
-    setAnalyzeNotice(null);
     try {
-      // 1. Message text — prefer the open conversation; fall back to the most
-      //    recent one so the button works from a fresh page load too.
-      let source = messages;
-      if (source.length === 0 && conversations.length > 0) {
-        source = await conversationService.getMessages(conversations[0].id);
+      // Source messages: the open conversation when one is selected, otherwise
+      // the first conversations that actually contain messages.
+      let source: Message[] = messages;
+      if (source.length === 0) {
+        for (const conversation of conversations.slice(0, 3)) {
+          const list = await conversationService.getMessages(conversation.id);
+          if (list.length > 0) {
+            source = list;
+            break;
+          }
+        }
       }
-      const messageText = buildMessageText(source);
-      if (!messageText.trim()) {
+      if (source.length === 0) {
         throw new Error('No messages found for this contact yet.');
       }
 
-      // 2. Analyze through the AI backend (custom schema included).
-      await insightService.analyzeContactLead({
-        contactId: id,
-        organizationId: contact.organization_id,
-        messageText,
-        customSchema: customFields.map((field) => ({
-          field_name: field.field_name,
-          field_label: field.field_label,
-          field_type: field.field_type,
-          description_for_ai: field.description_for_ai,
-          options: field.options,
-        })),
+      const result = await crmFieldService.extractContactCrmFields({
+        contact,
+        customFields,
+        messages: source,
+        existingValues: customValues,
       });
 
-      // 3. Refresh insights + custom values in place — no page reload needed.
-      const [freshInsights, freshValues] = await Promise.all([
-        insightService.listContactInsights(id),
-        insightService.getContactCustomValues(id),
+      // Refresh the CRM record in place — no page reload needed.
+      const [freshContact, freshValues] = await Promise.all([
+        contactService.getContactById(contact.id),
+        crmFieldService.getContactCustomValues(contact.id),
       ]);
-      setInsights(freshInsights);
-      setInsightsError(null);
+      if (freshContact) setContact(freshContact);
       setCustomValues(freshValues);
-      setAnalyzeNotice('✅ Lead analyzed — insights and custom fields updated.');
+
+      const written = [...result.appliedCustomFields, ...result.appliedContactFields];
+      const notes: string[] = [
+        written.length > 0
+          ? `CRM updated: ${written.join(', ')}.`
+          : 'No new CRM values found in this conversation.',
+      ];
+      if (result.skipped.length > 0) {
+        notes.push(`Left unchanged: ${result.skipped.join('; ')}.`);
+      }
+      setExtractNotice(notes.join(' '));
     } catch (err) {
-      setAnalyzeError(err instanceof Error ? err.message : 'AI analysis failed.');
+      setExtractError(err instanceof Error ? err.message : 'CRM extraction failed.');
     } finally {
-      setAnalyzing(false);
+      setExtracting(false);
     }
   };
 
@@ -402,11 +347,6 @@ export default function ContactDetails() {
       </div>
     );
   }
-
-  // Insights come from their own contact-scoped fetch, so they are stored as
-  // the list itself — no cross-contact guard is needed.
-  const insightsForContact: ContactInsight[] = insights;
-  const insightsErrorForContact: string | null = !insightsLoading ? insightsError : null;
 
   return (
     <div className="p-6">
@@ -504,103 +444,49 @@ export default function ContactDetails() {
         </Card>
       </div>
 
-      {/* AI Insights — server-side inferences only (contact_ai_insights).
-          Physically separate from Contact Information because an inference is
-          never a confirmed fact. Nothing writes these rows in this phase; the
-          expected state is "No insights yet." `source_message_ids` stays
-          hidden as an internal technical detail. */}
+      {/* CRM data — the fields the organization defined, filled by the AI from
+          the conversation. This is where the user reads the customer
+          information; the messages further down are the supporting source. */}
       <Card className="mb-6">
         <CardContent className="p-6">
           <div className="flex flex-wrap items-center justify-between gap-3 mb-2">
-            <h2 className="font-semibold">AI Insights</h2>
+            <h2 className="font-semibold">CRM Data</h2>
             <button
               type="button"
-              onClick={handleAnalyzeLead}
-              disabled={analyzing}
-              title="The CRM is analyzed automatically on every new message — use this to force a fresh analysis."
-              className="inline-flex items-center gap-2 h-9 px-4 rounded-md bg-gradient-to-r from-violet-600 to-indigo-600 text-white text-sm font-medium shadow hover:from-violet-500 hover:to-indigo-500 disabled:opacity-50 disabled:cursor-not-allowed"
+              onClick={handleExtractCrmData}
+              disabled={extracting}
+              title="Incoming messages are processed automatically. Use this to extract the CRM fields from this conversation again."
+              className="inline-flex items-center h-9 px-4 rounded-md border text-sm font-medium hover:bg-muted disabled:opacity-50 disabled:cursor-not-allowed"
             >
-              {analyzing ? '🪄 Re-analyzing…' : '🪄 Re-analyze with AI'}
+              {extracting ? 'Extracting CRM data...' : 'Extract CRM data with AI'}
             </button>
           </div>
           <p className="text-xs text-muted-foreground mb-4">
-            Filled automatically from incoming messages by the AI pipeline — re-analyze any
-            time the customer sends something new.
+            Values are extracted from incoming messages into the fields defined in AI
+            Configuration. A field the conversation does not mention stays empty — nothing is
+            guessed or overwritten.
           </p>
 
-          {analyzeError && <p className="text-sm text-destructive mb-3">{analyzeError}</p>}
-          {analyzeNotice && <p className="text-sm text-green-600 mb-3">{analyzeNotice}</p>}
+          {extractError && <p className="text-sm text-destructive mb-3">{extractError}</p>}
+          {extractNotice && <p className="text-sm text-muted-foreground mb-3">{extractNotice}</p>}
 
-          {insightsLoading && (
-            <p className="text-sm text-muted-foreground">Loading insights…</p>
-          )}
-
-          {insightsErrorForContact && (
-            <p className="text-sm text-destructive">
-              Could not load insights: {insightsErrorForContact}
+          {customFields.length === 0 ? (
+            <p className="text-sm text-muted-foreground">
+              No CRM fields defined yet. Add them under AI Configuration &gt; Custom Fields.
             </p>
+          ) : (
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+              {customFields.map((field) => (
+                <DetailRow
+                  key={field.id}
+                  label={field.field_label}
+                  value={formatCustomValue(customValues?.[field.field_name])}
+                />
+              ))}
+            </div>
           )}
-
-          {!insightsLoading && !insightsErrorForContact && insightsForContact.length === 0 && (
-            <p className="text-sm text-muted-foreground">No insights yet.</p>
-          )}
-
-          {!insightsLoading && !insightsErrorForContact && insightsForContact.length > 0 && (
-            <ul className="space-y-3">
-              {insightsForContact.map((insight) => (
-                  <li key={insight.id} className="border rounded-md p-4">
-                    <div className="flex items-center gap-2 flex-wrap mb-2">
-                      <span
-                        className={`px-2 py-1 rounded-full text-xs font-medium ${
-                          insightTypeClasses[insight.insight_type] ??
-                          'bg-secondary text-secondary-foreground'
-                        }`}
-                      >
-                        {insight.insight_type}
-                      </span>
-                      {insight.confidence !== null && insight.confidence !== undefined && (
-                        <span className="text-xs text-muted-foreground">
-                          confidence {Number(insight.confidence).toFixed(2)}
-                        </span>
-                      )}
-                      <span className="text-xs text-muted-foreground ml-auto">
-                        {formatDateTime(insight.created_at)}
-                      </span>
-                    </div>
-                    <p className="text-sm whitespace-pre-wrap break-words">
-                      {insightValueText(insight.value)}
-                    </p>
-                    <p className="text-xs text-muted-foreground mt-2">model: {insight.model}</p>
-                  </li>
-                ))}
-              </ul>
-            )}
         </CardContent>
       </Card>
-
-      {/* Dynamic Custom CRM — extracted values for the org's custom fields. */}
-      {customFields.length > 0 && (
-        <Card className="mb-6">
-          <CardContent className="p-6">
-            <h2 className="font-semibold mb-4">Custom CRM Data</h2>
-            {customValues && Object.keys(customValues).length > 0 ? (
-              <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-                {customFields.map((field) => (
-                  <DetailRow
-                    key={field.id}
-                    label={field.field_label}
-                    value={formatCustomValue(customValues[field.field_name])}
-                  />
-                ))}
-              </div>
-            ) : (
-              <p className="text-sm text-muted-foreground">
-                No custom values extracted yet — run the AI analysis to fill these fields.
-              </p>
-            )}
-          </CardContent>
-        </Card>
-      )}
 
       {/* Conversations — a plain list on purpose: a contact can have several
           conversations (there is no unique constraint on contact_id). */}

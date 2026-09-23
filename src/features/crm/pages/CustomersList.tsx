@@ -2,7 +2,7 @@ import { useEffect, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { Card, CardContent } from "@/components/ui/card";
 import { contactService } from '@/services/contactService';
-import { insightService } from '@/services/insightService';
+import { crmFieldService } from '@/services/crmFieldService';
 import { organizationService } from '@/services/organizationService';
 import { Contact, ContactCustomValues, CrmCustomField } from '@/types';
 import { customerStatusClasses, formatCustomValue, formatDate, formatLocation } from '../crmFormat';
@@ -48,8 +48,8 @@ export default function CustomersList() {
       .getCurrentOrganizationId()
       .then(async (orgId) => {
         const [fields, valuesMap] = await Promise.all([
-          insightService.listCustomFields(orgId),
-          insightService.listContactCustomValues(orgId),
+          crmFieldService.listCustomFields(orgId),
+          crmFieldService.listContactCustomValues(orgId),
         ]);
         if (!cancelled) {
           setCustomFields(fields);
@@ -78,8 +78,8 @@ export default function CustomersList() {
         .getCurrentOrganizationId()
         .then(async (orgId) => {
           const [fields, valuesMap] = await Promise.all([
-            insightService.listCustomFields(orgId),
-            insightService.listContactCustomValues(orgId),
+            crmFieldService.listCustomFields(orgId),
+            crmFieldService.listContactCustomValues(orgId),
           ]);
           setCustomFields(fields);
           setValuesByContact(valuesMap);

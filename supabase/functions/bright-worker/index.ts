@@ -382,11 +382,11 @@ async function enrichContactUsername(
 }
 
 // ---------------------------------------------------------------------------
-// AI LEAD ANALYZER — automatic background pipeline trigger (best-effort).
+// AI CRM EXTRACTION — automatic background pipeline trigger (best-effort).
 //
 // Fired once per saved inbound message. The AI backend (Render) loads the
-// conversation transcript + the organization's custom CRM fields, runs the
-// Gemini analysis and writes insights / custom values / contact updates —
+// conversation transcript + the organization's CRM schema, extracts the CRM
+// values through Gemini and writes contact_custom_values / contact updates —
 // completely server-side, without any user interaction.
 //
 // Behavior contract (mirrors enrichContactUsername):
@@ -415,7 +415,10 @@ async function triggerAiLeadAnalysis(params: {
   }
 
   const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), 25_000);
+  // The AI backend allows Gemini 60s per request, so the trigger must wait
+  // longer than that — aborting earlier would log a failure while the backend
+  // is still writing the CRM values.
+  const timeoutId = setTimeout(() => controller.abort(), 70_000);
   try {
     const headers: Record<string, string> = { 'Content-Type': 'application/json' };
     const secret = (Deno.env.get('AI_BACKEND_WEBHOOK_SECRET') ?? '').trim();
@@ -437,7 +440,7 @@ async function triggerAiLeadAnalysis(params: {
       const detail = await res.text().catch(() => '');
       console.warn(`AI_ANALYSIS_FAILED: backend responded ${res.status} ${detail.slice(0, 200)}`);
     } else {
-      console.log('AI_ANALYSIS_OK: lead analysis written by the AI backend');
+      console.log('AI_ANALYSIS_OK: CRM fields written by the AI backend');
     }
   } catch (e) {
     console.warn(
@@ -665,9 +668,9 @@ async function persistEvent(
     messageId: event.external_message_id,
   });
 
-  // 7. Fire-and-forget: automatic AI lead analysis on every inbound message.
-  //    The AI backend (Render) does everything server-side; this call must
-  //    never block or fail the webhook, so it runs in the background
+  // 7. Fire-and-forget: automatic AI CRM field extraction on every inbound
+  //    message. The AI backend (Render) does everything server-side; this call
+  //    must never block or fail the webhook, so it runs in the background
   //    (EdgeRuntime.waitUntil) with its own timeout.
   const aiTrigger = triggerAiLeadAnalysis({
     organizationId: resolvedOrgId,

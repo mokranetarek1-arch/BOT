@@ -25,6 +25,12 @@ export default tseslint.config(
         'warn',
         { allowConstantExport: true },
       ],
+      // `_`-prefixed parameters are intentionally unused (Express error handlers
+      // need all four parameters, unused request objects, etc.).
+      '@typescript-eslint/no-unused-vars': [
+        'error',
+        { argsIgnorePattern: '^_', varsIgnorePattern: '^_' },
+      ],
     },
   },
 )
