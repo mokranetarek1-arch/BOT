@@ -129,8 +129,10 @@ Deno.serve(async (req: Request) => {
     authorizeUrl.searchParams.set('response_type', 'code');
     authorizeUrl.searchParams.set(
       'scope',
-      'pages_show_list,pages_read_engagement,pages_manage_metadata,pages_messaging',
+      'pages_show_list,pages_read_engagement,pages_manage_metadata,pages_messaging,business_management',
     );
+    // Force Facebook to always prompt so user can check/re-select which pages they authorize
+    authorizeUrl.searchParams.set('auth_type', 'rerequest');
     authorizeUrl.searchParams.set('state', (body['state'] as string) ?? crypto.randomUUID());
     return json({ authorize_url: authorizeUrl.toString() });
   }
@@ -156,6 +158,7 @@ Deno.serve(async (req: Request) => {
       const userAccessToken = tokenData.access_token;
       const accountsUrl = new URL('https://graph.facebook.com/v22.0/me/accounts');
       accountsUrl.searchParams.set('fields', 'id,name,access_token');
+      accountsUrl.searchParams.set('limit', '100');
       accountsUrl.searchParams.set('access_token', userAccessToken);
 
       const accountsRes = await fetch(accountsUrl.toString());
@@ -164,7 +167,37 @@ Deno.serve(async (req: Request) => {
         throw new Error(`Fetching Facebook pages failed: ${accountsData.error?.message ?? accountsRes.status}`);
       }
 
-      const pages = Array.isArray(accountsData.data) ? accountsData.data : [];
+      let pages = Array.isArray(accountsData.data) ? accountsData.data : [];
+
+      // Also fetch pages owned by businesses the user has access to, in case any were omitted from /me/accounts
+      try {
+        const bizUrl = new URL('https://graph.facebook.com/v22.0/me/businesses');
+        bizUrl.searchParams.set('fields', 'id,name');
+        bizUrl.searchParams.set('access_token', userAccessToken);
+        const bizRes = await fetch(bizUrl.toString());
+        const bizData = await bizRes.json();
+        if (bizRes.ok && Array.isArray(bizData.data)) {
+          const existingIds = new Set(pages.map((p: Record<string, unknown>) => String(p.id)));
+          for (const biz of bizData.data) {
+            const bizPagesUrl = new URL(`https://graph.facebook.com/v22.0/${biz.id}/owned_pages`);
+            bizPagesUrl.searchParams.set('fields', 'id,name,access_token');
+            bizPagesUrl.searchParams.set('limit', '100');
+            bizPagesUrl.searchParams.set('access_token', userAccessToken);
+            const bpRes = await fetch(bizPagesUrl.toString());
+            const bpData = await bpRes.json();
+            if (bpRes.ok && Array.isArray(bpData.data)) {
+              for (const p of bpData.data) {
+                if (!existingIds.has(String(p.id))) {
+                  pages.push(p);
+                  existingIds.add(String(p.id));
+                }
+              }
+            }
+          }
+        }
+      } catch (bizErr) {
+        console.warn('[facebook-oauth] business pages lookup non-fatal error:', bizErr);
+      }
       if (pages.length === 0) {
         return json(
           { error: 'No Facebook Page found. Ensure you manage a Facebook Page and that you granted permission.' },
@@ -257,6 +290,7 @@ Deno.serve(async (req: Request) => {
     try {
       const accountsUrl = new URL('https://graph.facebook.com/v22.0/me/accounts');
       accountsUrl.searchParams.set('fields', 'id,name,access_token');
+      accountsUrl.searchParams.set('limit', '100');
       accountsUrl.searchParams.set('access_token', userAccessToken);
 
       const accountsRes = await fetch(accountsUrl.toString());
@@ -265,8 +299,40 @@ Deno.serve(async (req: Request) => {
         throw new Error(`Fetching Facebook pages failed: ${accountsData.error?.message ?? accountsRes.status}`);
       }
 
-      const pages = Array.isArray(accountsData.data) ? accountsData.data : [];
-      const targetPage = pages.find((p: Record<string, unknown>) => String(p.id) === String(pageId));
+      let pages = Array.isArray(accountsData.data) ? accountsData.data : [];
+
+      let targetPage = pages.find((p: Record<string, unknown>) => String(p.id) === String(pageId));
+
+      // Check owned_pages of businesses if not found directly
+      if (!targetPage) {
+        try {
+          const bizUrl = new URL('https://graph.facebook.com/v22.0/me/businesses');
+          bizUrl.searchParams.set('fields', 'id,name');
+          bizUrl.searchParams.set('access_token', userAccessToken);
+          const bizRes = await fetch(bizUrl.toString());
+          const bizData = await bizRes.json();
+          if (bizRes.ok && Array.isArray(bizData.data)) {
+            for (const biz of bizData.data) {
+              const bpUrl = new URL(`https://graph.facebook.com/v22.0/${biz.id}/owned_pages`);
+              bpUrl.searchParams.set('fields', 'id,name,access_token');
+              bpUrl.searchParams.set('limit', '100');
+              bpUrl.searchParams.set('access_token', userAccessToken);
+              const bpRes = await fetch(bpUrl.toString());
+              const bpData = await bpRes.json();
+              if (bpRes.ok && Array.isArray(bpData.data)) {
+                const found = bpData.data.find((p: Record<string, unknown>) => String(p.id) === String(pageId));
+                if (found) {
+                  targetPage = found;
+                  break;
+                }
+              }
+            }
+          }
+        } catch {
+          // ignore
+        }
+      }
+
       if (!targetPage) {
         return json({ error: `Page with ID ${pageId} not found among authorized pages.` }, 404);
       }
