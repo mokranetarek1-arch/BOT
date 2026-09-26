@@ -172,7 +172,24 @@ Deno.serve(async (req: Request) => {
         );
       }
 
-      const primaryPage = pages[0];
+      const requestedPageId = body['page_id'] ? String(body['page_id']) : null;
+
+      // If user has multiple pages and did not specify one yet, return the list for selection
+      if (pages.length > 1 && !requestedPageId) {
+        return json({
+          ok: true,
+          selection_required: true,
+          user_access_token: userAccessToken,
+          pages: pages.map((p: Record<string, unknown>) => ({
+            id: String(p.id),
+            name: String(p.name),
+          })),
+        });
+      }
+
+      const primaryPage = requestedPageId
+        ? pages.find((p: Record<string, unknown>) => String(p.id) === requestedPageId) ?? pages[0]
+        : pages[0];
       const pageId = String(primaryPage.id);
       const pageName = String(primaryPage.name);
       const pageAccessToken = String(primaryPage.access_token);
@@ -227,6 +244,86 @@ Deno.serve(async (req: Request) => {
     } catch (e) {
       console.error('[facebook-oauth] callback error:', e);
       return json({ error: e instanceof Error ? e.message : 'Unknown Facebook OAuth error.' }, 502);
+    }
+  }
+
+  if (action === 'select_page') {
+    const userAccessToken = body['user_access_token'] as string;
+    const pageId = body['page_id'] as string;
+    if (!userAccessToken || !pageId) {
+      return json({ error: 'user_access_token and page_id are required.' }, 400);
+    }
+
+    try {
+      const accountsUrl = new URL('https://graph.facebook.com/v22.0/me/accounts');
+      accountsUrl.searchParams.set('fields', 'id,name,access_token');
+      accountsUrl.searchParams.set('access_token', userAccessToken);
+
+      const accountsRes = await fetch(accountsUrl.toString());
+      const accountsData = await accountsRes.json();
+      if (!accountsRes.ok || accountsData.error) {
+        throw new Error(`Fetching Facebook pages failed: ${accountsData.error?.message ?? accountsRes.status}`);
+      }
+
+      const pages = Array.isArray(accountsData.data) ? accountsData.data : [];
+      const targetPage = pages.find((p: Record<string, unknown>) => String(p.id) === String(pageId));
+      if (!targetPage) {
+        return json({ error: `Page with ID ${pageId} not found among authorized pages.` }, 404);
+      }
+
+      const pageName = String(targetPage.name);
+      const pageAccessToken = String(targetPage.access_token);
+
+      const columns = await getSocialAccountColumns(admin);
+      const row: Record<string, unknown> = {};
+      if (columns.has('organization_id')) row.organization_id = organizationId;
+      if (columns.has('platform')) row.platform = 'facebook';
+      if (columns.has('external_account_id')) row.external_account_id = String(pageId);
+      if (columns.has('account_name')) row.account_name = pageName;
+
+      if (columns.has('access_token_encrypted')) {
+        row.access_token_encrypted = pageAccessToken;
+      } else if (columns.has('access_token')) {
+        row.access_token = pageAccessToken;
+      }
+      if (columns.has('connected_at')) row.connected_at = new Date().toISOString();
+
+      const { data: saved, error: upsertError } = await admin
+        .from('social_accounts')
+        .upsert(row, { onConflict: 'organization_id,platform,external_account_id' })
+        .select('*')
+        .single();
+
+      if (upsertError) {
+        return json({ error: `Failed to save Facebook account: ${upsertError.message}` }, 500);
+      }
+
+      // Webhook subscription
+      try {
+        const subUrl = new URL(`https://graph.facebook.com/v22.0/${pageId}/subscribed_apps`);
+        await fetch(subUrl.toString(), {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            subscribed_fields: ['messages', 'messaging_postbacks'],
+            access_token: pageAccessToken,
+          }),
+        });
+      } catch (e) {
+        console.warn('[facebook-oauth] page webhook subscription warning:', e);
+      }
+
+      return json({
+        ok: true,
+        account: {
+          id: saved?.id ?? null,
+          external_account_id: String(pageId),
+          name: pageName,
+        },
+      });
+    } catch (e) {
+      console.error('[facebook-oauth] select_page error:', e);
+      return json({ error: e instanceof Error ? e.message : 'Unknown select_page error.' }, 502);
     }
   }
 

@@ -1,9 +1,9 @@
 import { useEffect, useRef, useState } from 'react';
-import { facebookService } from '@/services/facebookService';
+import { facebookService, FacebookPageOption } from '@/services/facebookService';
 import { SocialAccount } from '@/types';
 import { Button } from '@/components/ui/button';
 
-type Phase = 'idle' | 'connecting' | 'callback' | 'done' | 'error';
+type Phase = 'idle' | 'connecting' | 'callback' | 'select_page' | 'done' | 'error';
 
 interface FacebookConnectProps {
   code?: string | null;
@@ -24,6 +24,11 @@ export default function FacebookConnect({
   const [message, setMessage] = useState<string | null>(
     code ? 'Finishing Facebook connection…' : null,
   );
+
+  // Multiple pages selection state
+  const [availablePages, setAvailablePages] = useState<FacebookPageOption[]>([]);
+  const [userAccessToken, setUserAccessToken] = useState<string | null>(null);
+  const [selectingPageId, setSelectingPageId] = useState<string | null>(null);
 
   const onCallbackHandledRef = useRef(onCallbackHandled);
   useEffect(() => {
@@ -82,6 +87,14 @@ export default function FacebookConnect({
       .handleCallback(code, state ?? null)
       .then((result) => {
         if (cancelled) return;
+        if (result.selection_required && result.pages && result.user_access_token) {
+          setAvailablePages(result.pages);
+          setUserAccessToken(result.user_access_token);
+          setPhase('select_page');
+          setMessage('Please select which Facebook Page you want to connect:');
+          return;
+        }
+
         setPhase('done');
         setMessage(`Connected as ${result.account?.name ?? 'Facebook Page'}.`);
         onConnectedRef.current?.();
@@ -103,6 +116,25 @@ export default function FacebookConnect({
       cancelled = true;
     };
   }, [code, state]);
+
+  const handleSelectPage = async (pageId: string) => {
+    if (!userAccessToken) return;
+    try {
+      setSelectingPageId(pageId);
+      setMessage('Connecting selected Page…');
+      const result = await facebookService.selectPage(userAccessToken, pageId);
+      setPhase('done');
+      setMessage(`Connected as ${result.account?.name ?? 'Facebook Page'}.`);
+      onConnectedRef.current?.();
+      const acc = await facebookService.getConnectedAccount();
+      if (acc) setAccount(acc);
+    } catch (err) {
+      setPhase('error');
+      setMessage(err instanceof Error ? err.message : 'Failed to connect selected Page.');
+    } finally {
+      setSelectingPageId(null);
+    }
+  };
 
   const handleConnect = async () => {
     try {
@@ -169,12 +201,38 @@ export default function FacebookConnect({
           <Button
             size="sm"
             onClick={handleConnect}
-            disabled={phase === 'connecting' || phase === 'callback'}
+            disabled={phase === 'connecting' || phase === 'callback' || phase === 'select_page'}
           >
             {phase === 'connecting' || phase === 'callback' ? 'Connecting…' : 'Connect'}
           </Button>
         )}
       </div>
+
+      {phase === 'select_page' && availablePages.length > 0 && (
+        <div className="mt-3 p-3 bg-muted/50 rounded-md border space-y-2">
+          <p className="text-xs font-semibold">Select a Facebook Page to connect:</p>
+          <div className="flex flex-col gap-2">
+            {availablePages.map((page) => (
+              <div
+                key={page.id}
+                className="flex items-center justify-between p-2 rounded bg-card border"
+              >
+                <div>
+                  <p className="text-sm font-medium">{page.name}</p>
+                  <p className="text-xs text-muted-foreground">ID: {page.id}</p>
+                </div>
+                <Button
+                  size="sm"
+                  onClick={() => handleSelectPage(page.id)}
+                  disabled={selectingPageId !== null}
+                >
+                  {selectingPageId === page.id ? 'Connecting…' : 'Select'}
+                </Button>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
 
       {message && (
         <p

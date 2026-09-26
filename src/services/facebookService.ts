@@ -14,10 +14,18 @@ export const FACEBOOK_REDIRECT_URI: string =
   import.meta.env.VITE_FACEBOOK_REDIRECT_URI ??
   `${window.location.origin}/integrations/facebook/callback`;
 
+export interface FacebookPageOption {
+  id: string;
+  name: string;
+}
+
 interface EdgeResult {
   ok?: boolean;
   error?: string;
   authorize_url?: string;
+  selection_required?: boolean;
+  user_access_token?: string;
+  pages?: FacebookPageOption[];
   account?: {
     id: string | null;
     external_account_id: string;
@@ -106,6 +114,17 @@ export const facebookService = {
       action: 'callback',
       code,
       redirect_uri: FACEBOOK_REDIRECT_URI,
+    });
+
+    if (result.error) throw new Error(result.error);
+    return result;
+  },
+
+  async selectPage(userAccessToken: string, pageId: string): Promise<EdgeResult> {
+    const result = await callEdge({
+      action: 'select_page',
+      user_access_token: userAccessToken,
+      page_id: pageId,
     });
 
     if (result.error) throw new Error(result.error);
