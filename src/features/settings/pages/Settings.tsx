@@ -2,6 +2,7 @@ import { useCallback, useMemo } from 'react';
 import { useSearchParams } from 'react-router-dom';
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import InstagramConnect from '@/features/settings/components/InstagramConnect';
+import FacebookConnect from '@/features/settings/components/FacebookConnect';
 
 export default function Settings() {
   const [searchParams, setSearchParams] = useSearchParams();
@@ -51,16 +52,8 @@ export default function Settings() {
               onCallbackHandled={clearCallbackParams}
             />
 
-            <div className="flex items-center justify-between p-4 border rounded-lg">
-              <div className="flex items-center gap-3">
-                <div className="w-10 h-10 bg-blue-100 text-blue-600 rounded-md flex items-center justify-center font-bold">FB</div>
-                <div>
-                  <p className="font-medium">Facebook Messenger</p>
-                  <p className="text-sm text-muted-foreground">Not connected</p>
-                </div>
-              </div>
-              <button className="h-9 px-4 rounded-md border-input bg-background hover:bg-accent text-sm font-medium">Connect</button>
-            </div>
+            {/* Facebook Messenger Integration */}
+            <FacebookConnect />
 
             <div className="flex items-center justify-between p-4 border rounded-lg">
               <div className="flex items-center gap-3">

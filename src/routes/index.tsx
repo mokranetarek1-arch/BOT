@@ -10,6 +10,7 @@ import AISettings from '@/features/ai/pages/AISettings';
 import Analytics from '@/features/analytics/pages/Analytics';
 import Settings from '@/features/settings/pages/Settings';
 import InstagramCallback from '@/features/settings/pages/InstagramCallback';
+import FacebookCallback from '@/features/settings/pages/FacebookCallback';
 import Login from '@/features/auth/pages/Login';
 import Register from '@/features/auth/pages/Register';
 
@@ -28,6 +29,7 @@ export const router = createBrowserRouter([
       { path: 'analytics', element: <Analytics /> },
       { path: 'settings', element: <Settings /> },
       { path: 'integrations/instagram/callback', element: <InstagramCallback /> },
+      { path: 'integrations/facebook/callback', element: <FacebookCallback /> },
     ],
   },
   {

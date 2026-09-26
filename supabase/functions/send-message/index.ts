@@ -198,14 +198,15 @@ function describeMetaFailure(
  */
 async function resolveRecipientId(
   admin: ReturnType<typeof createClient>,
-  params: { contactId: string | null; conversationId: string },
+  params: { contactId: string | null; conversationId: string; channel?: string },
 ): Promise<string | null> {
+  const targetChannel = params.channel ?? 'instagram';
   if (params.contactId) {
     const { data, error } = await admin
       .from('contact_channels')
       .select('external_user_id')
       .eq('contact_id', params.contactId)
-      .eq('channel', 'instagram')
+      .eq('channel', targetChannel)
       .order('created_at', { ascending: true })
       .limit(1);
 
@@ -360,14 +361,15 @@ Deno.serve(async (req: Request) => {
   }
   if (!conversation) return json({ error: 'Conversation not found.' }, 404);
 
-  if (conversation.channel !== 'instagram') {
+  const isFacebook = conversation.channel === 'facebook';
+  if (conversation.channel !== 'instagram' && !isFacebook) {
     return json(
       { error: `Replying is not supported on the "${conversation.channel}" channel yet.` },
       400,
     );
   }
 
-  // ---- The connected Instagram account (the token stays server-side) ----
+  // ---- The connected Social account (the token stays server-side) ----
   const columns = await getSocialAccountColumns(admin);
   // Same precedence as instagram-oauth: an explicit encrypted column wins.
   const tokenColumn = columns.has('access_token_encrypted')
@@ -380,9 +382,9 @@ Deno.serve(async (req: Request) => {
     return json(
       {
         error:
-          'social_accounts has no access_token / access_token_encrypted column — the Instagram token was never stored.',
+          'social_accounts has no access_token / access_token_encrypted column — the token was never stored.',
         hint:
-          'Add the column, then reconnect Instagram in Settings (supabase/functions/instagram-oauth/README.md, step 4).',
+          'Add the column, then reconnect in Settings.',
       },
       500,
     );
@@ -396,40 +398,41 @@ Deno.serve(async (req: Request) => {
     .maybeSingle();
 
   if (saError) {
-    return json({ error: `Could not load the Instagram account: ${saError.message}` }, 500);
+    return json({ error: `Could not load the social account: ${saError.message}` }, 500);
   }
   if (!socialAccount) {
     return json(
-      { error: 'Connected Instagram account not found — reconnect Instagram in Settings.' },
+      { error: 'Connected account not found — reconnect it in Settings.' },
       404,
     );
   }
 
   const accountRow = socialAccount as Record<string, unknown>;
-  const igId = String(accountRow['external_account_id'] ?? '');
+  const accountExternalId = String(accountRow['external_account_id'] ?? '');
   const accessToken = String(accountRow[tokenColumn] ?? '');
 
-  if (!igId) {
+  if (!accountExternalId) {
     return json(
-      { error: 'The connected Instagram account has no external_account_id — reconnect it.' },
+      { error: 'The connected account has no external_account_id — reconnect it.' },
       400,
     );
   }
   if (!accessToken) {
     return json(
-      { error: 'No Instagram access token stored for this account — reconnect Instagram.' },
+      { error: 'No access token stored for this account — reconnect it in Settings.' },
       400,
     );
   }
 
-  // ---- Recipient (customer IGSID) ---------------------------------------
+  // ---- Recipient (customer PSID or IGSID) --------------------------------
   const recipientId = await resolveRecipientId(admin, {
     contactId: (conversation.contact_id as string | null) ?? null,
     conversationId: String(conversation.id),
+    channel: conversation.channel,
   });
   if (!recipientId) {
     return json(
-      { error: 'Could not resolve the Instagram recipient for this conversation.' },
+      { error: `Could not resolve the ${conversation.channel} recipient for this conversation.` },
       422,
     );
   }
@@ -442,8 +445,9 @@ Deno.serve(async (req: Request) => {
   if (windowError) return json({ error: windowError }, 409);
 
   // ---- Send through Meta ------------------------------------------------
-  const graph = resolveGraphBase();
-  const endpoint = `${graph.base}/${encodeURIComponent(igId)}/messages`;
+  const endpoint = isFacebook
+    ? 'https://graph.facebook.com/v22.0/me/messages'
+    : `${resolveGraphBase().base}/${encodeURIComponent(accountExternalId)}/messages`;
 
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), SEND_TIMEOUT_MS);
@@ -451,6 +455,14 @@ Deno.serve(async (req: Request) => {
   let res: Response;
   let payload: unknown = null;
   try {
+    const reqBody: Record<string, unknown> = {
+      recipient: { id: recipientId },
+      message: { text },
+    };
+    if (isFacebook) {
+      reqBody.messaging_type = 'RESPONSE';
+    }
+
     res = await fetch(endpoint, {
       method: 'POST',
       headers: {
@@ -458,7 +470,7 @@ Deno.serve(async (req: Request) => {
         // Never logged, never echoed back to the client.
         Authorization: `Bearer ${accessToken}`,
       },
-      body: JSON.stringify({ recipient: { id: recipientId }, message: { text } }),
+      body: JSON.stringify(reqBody),
       signal: controller.signal,
     });
     payload = await res.json().catch(() => null);
@@ -466,7 +478,7 @@ Deno.serve(async (req: Request) => {
     if (e instanceof Error && e.name === 'AbortError') {
       return json(
         {
-          error: `Instagram did not answer within ${SEND_TIMEOUT_MS / 1000}s. The message was NOT sent.`,
+          error: `Meta did not answer within ${SEND_TIMEOUT_MS / 1000}s. The message was NOT sent.`,
         },
         504,
       );
@@ -475,7 +487,7 @@ Deno.serve(async (req: Request) => {
       '[send-message] Graph call failed:',
       e instanceof Error ? e.message : String(e),
     );
-    return json({ error: 'Could not reach Instagram. Check the Edge Function logs.' }, 502);
+    return json({ error: 'Could not reach Meta API. Check the Edge Function logs.' }, 502);
   } finally {
     clearTimeout(timeoutId);
   }
@@ -510,14 +522,13 @@ Deno.serve(async (req: Request) => {
     organization_id: organizationId,
     conversation_id: conversation.id,
     external_message_id: externalMessageId,
-    // The business account is the sender of an outbound message.
-    sender_external_id: igId,
+    sender_external_id: accountExternalId,
     message_text: text,
     message_type: 'text',
     raw_data: payload,
     created_at: nowIso,
   };
-  if (msgColumns.has('channel')) messageRow.channel = 'instagram';
+  if (msgColumns.has('channel')) messageRow.channel = conversation.channel;
   if (msgColumns.has('direction')) messageRow.direction = 'outbound';
 
   const { data: saved, error: insertError } = await admin
@@ -533,11 +544,11 @@ Deno.serve(async (req: Request) => {
     organization_id: organizationId,
     conversation_id: conversation.id,
     external_message_id: externalMessageId,
-    sender_external_id: igId,
+    sender_external_id: accountExternalId,
     message_type: 'text',
     message_text: text,
     direction: 'outbound',
-    channel: 'instagram',
+    channel: conversation.channel,
     created_at: typeof storedCreatedAt === 'string' ? storedCreatedAt : nowIso,
   };
 
