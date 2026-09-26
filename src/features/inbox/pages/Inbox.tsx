@@ -1,7 +1,117 @@
 import { useEffect, useState, type KeyboardEvent } from 'react';
-import { RefreshCw } from 'lucide-react';
+import { RefreshCw, FileText, Download } from 'lucide-react';
 import { conversationService } from '@/services/conversationService';
 import { Conversation, Message } from '@/types';
+
+interface AttachmentItem {
+  type: string | null;
+  url: string | null;
+}
+
+function parseAttachments(raw: unknown): AttachmentItem[] {
+  if (!Array.isArray(raw)) return [];
+  const parsed: AttachmentItem[] = [];
+  for (const item of raw) {
+    if (item && typeof item === 'object') {
+      const rec = item as Record<string, unknown>;
+      parsed.push({
+        type: typeof rec.type === 'string' ? rec.type : null,
+        url: typeof rec.url === 'string' ? rec.url : null,
+      });
+    }
+  }
+  return parsed;
+}
+
+function AttachmentRenderer({
+  attachment,
+  isOutbound,
+}: {
+  attachment: AttachmentItem;
+  isOutbound: boolean;
+}) {
+  const { type, url } = attachment;
+
+  if (!url) {
+    return (
+      <div className="text-xs italic opacity-75">
+        [{type ?? 'attachment'} — url unavailable]
+      </div>
+    );
+  }
+
+  // 1. Audio / Voice Note
+  if (type === 'audio') {
+    return (
+      <div className="my-1 w-full min-w-[220px]">
+        <audio
+          controls
+          src={url}
+          preload="metadata"
+          className="w-full h-8 rounded"
+        >
+          Your browser does not support the audio element.
+        </audio>
+      </div>
+    );
+  }
+
+  // 2. Image
+  if (type === 'image') {
+    return (
+      <div className="my-1">
+        <a href={url} target="_blank" rel="noopener noreferrer" className="block group">
+          <img
+            src={url}
+            alt="Instagram DM attachment"
+            loading="lazy"
+            className="max-h-60 max-w-full rounded-lg object-contain cursor-pointer transition hover:opacity-95"
+          />
+        </a>
+      </div>
+    );
+  }
+
+  // 3. Video
+  if (type === 'video') {
+    return (
+      <div className="my-1 max-w-full">
+        <video
+          controls
+          src={url}
+          preload="metadata"
+          className="max-h-64 max-w-full rounded-lg"
+        >
+          Your browser does not support the video tag.
+        </video>
+      </div>
+    );
+  }
+
+  // 4. File / Document / Fallback
+  return (
+    <div
+      className={`my-1 flex items-center gap-2 p-2 rounded-lg text-xs ${
+        isOutbound ? 'bg-primary-foreground/10' : 'bg-background/60'
+      }`}
+    >
+      <FileText className="w-4 h-4 shrink-0" />
+      <span className="truncate flex-1 font-medium">
+        {type ? `Fichier (${type})` : 'Document joint'}
+      </span>
+      <a
+        href={url}
+        target="_blank"
+        rel="noopener noreferrer"
+        download
+        className="p-1 rounded hover:bg-black/10 dark:hover:bg-white/10 shrink-0"
+        title="Ouvrir / Télécharger"
+      >
+        <Download className="w-3.5 h-3.5" />
+      </a>
+    </div>
+  );
+}
 
 function formatTime(iso: string | null | undefined): string {
   if (!iso) return '';
@@ -18,7 +128,19 @@ function previewOf(conversation: Conversation): string {
   const messages = conversation.messages ?? [];
   const last = messages[messages.length - 1];
   if (!last) return 'No messages yet';
-  return last.message_text ?? `[${last.message_type}]`;
+  if (last.message_text) return last.message_text;
+  switch (last.message_type) {
+    case 'audio':
+      return '🎤 Message vocal';
+    case 'image':
+      return '📷 Photo';
+    case 'video':
+      return '🎥 Vidéo';
+    case 'file':
+      return '📎 Fichier';
+    default:
+      return `[${last.message_type}]`;
+  }
 }
 
 const channelBadgeClasses: Record<string, string> = {
@@ -239,6 +361,7 @@ export default function Inbox() {
             <div className="flex flex-col space-y-4">
               {messages.map((message) => {
                 const isOutbound = message.direction === 'outbound';
+                const attachments = parseAttachments(message.attachments);
                 return (
                   <div
                     key={message.id}
@@ -247,15 +370,33 @@ export default function Inbox() {
                     <div className="w-8 h-8 rounded-full bg-accent flex items-center justify-center mx-3 shrink-0 text-xs font-medium">
                       {(message.sender_external_id?.slice(-2) ?? '??').toUpperCase()}
                     </div>
-                    <div className={isOutbound ? 'text-right' : ''}>
+                    <div className={`max-w-md ${isOutbound ? 'text-right' : ''}`}>
                       <div
-                        className={`p-3 rounded-2xl text-sm max-w-md break-words ${
+                        className={`p-3 rounded-2xl text-sm break-words inline-block text-left ${
                           isOutbound
                             ? 'bg-primary text-primary-foreground rounded-tr-sm'
                             : 'bg-muted rounded-tl-sm'
                         }`}
                       >
-                        {message.message_text ?? `[${message.message_type}]`}
+                        {/* Attachments rendering (audio player, image preview, video, files) */}
+                        {attachments.length > 0 && (
+                          <div className="space-y-2 mb-2">
+                            {attachments.map((att, idx) => (
+                              <AttachmentRenderer
+                                key={idx}
+                                attachment={att}
+                                isOutbound={isOutbound}
+                              />
+                            ))}
+                          </div>
+                        )}
+
+                        {/* Text message (or fallback if no text and no attachments) */}
+                        {message.message_text ? (
+                          <p className="whitespace-pre-wrap">{message.message_text}</p>
+                        ) : attachments.length === 0 ? (
+                          <p className="italic opacity-80">[{message.message_type}]</p>
+                        ) : null}
                       </div>
                       <p className="mt-1 text-[10px] text-muted-foreground">
                         {formatDate(message.created_at)} · {message.direction ?? 'inbound'} ·{' '}
