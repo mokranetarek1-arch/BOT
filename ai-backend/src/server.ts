@@ -11,6 +11,7 @@ import express, { type Request, type Response } from 'express';
 import { GEMINI_MODEL } from './config';
 import { callGemini, GeminiError } from './gemini';
 import { processInboundMessage } from './pipeline';
+import { AiProviderError, runExtraction } from './provider';
 import {
   buildCrmSchema,
   buildExtractionPrompt,
@@ -125,16 +126,25 @@ app.post('/ai/test', async (_req: Request, res: Response) => {
 // Pure extraction: this route never touches the database. The caller (the CRM
 // frontend, or bright-worker for a re-run) owns persistence through RLS.
 //
-// Returns: { success, model, prompt_version, contact_id, organization_id,
-//            crm_fields_used, updates: [ { field, value, confidence,
-//                                         evidence_message_id } ] }
+// Returns: { success, provider, model, prompt_version, contact_id,
+//            organization_id, crm_fields_used, updates: [ { field, value,
+//            confidence, evidence_message_id } ] }
+// `provider` is additive metadata: 'gemini' | 'openrouter' — which model actually
+// answered. Every previously returned field is unchanged.
 // ---------------------------------------------------------------------------
 app.post('/ai/extract-crm-fields', async (req: Request, res: Response) => {
-  const apiKey = process.env.GEMINI_API_KEY;
-  if (!apiKey) {
+  const geminiApiKey = process.env.GEMINI_API_KEY;
+  const openrouterApiKey = process.env.OPENROUTER_API_KEY;
+  // Dev/test only: AI_TEST_PROVIDER=openrouter exercises the fallback provider
+  // directly without needing a real Gemini outage. Server-side env only —
+  // a client request can never set it (no production security hole).
+  const forcesOpenRouter = (process.env.AI_TEST_PROVIDER ?? '').trim().toLowerCase() === 'openrouter';
+  if (forcesOpenRouter ? !openrouterApiKey : !geminiApiKey) {
     return res.status(500).json({
       success: false,
-      error: 'GEMINI_API_KEY is not configured on the server.',
+      error: forcesOpenRouter
+        ? 'OPENROUTER_API_KEY is not configured on the server.'
+        : 'GEMINI_API_KEY is not configured on the server.',
     });
   }
 
@@ -150,26 +160,32 @@ app.post('/ai/extract-crm-fields', async (req: Request, res: Response) => {
     });
   }
 
-  // CRM schema + conversation messages are validated, sent to Gemini and
-  // normalized inside one block so every failure keeps its own HTTP status.
+  // CRM schema + conversation messages are validated, sent through the AI
+  // provider chain and normalized inside one block so every failure keeps its
+  // own HTTP status. Sequential fallback: Gemini (primary, one transient
+  // retry) → OpenRouter free-model chain (same prompt) — never in parallel.
   try {
     const fields = buildCrmSchema(sanitizeCrmFields(body.crm_fields));
     const messages = sanitizeMessages(body.messages);
 
-    const text = await callGemini({
-      apiKey,
-      model: GEMINI_MODEL,
+    const extraction = await runExtraction({
+      geminiApiKey,
+      openrouterApiKey,
       prompt: buildExtractionPrompt(fields, messages),
       generationConfig: EXTRACTION_GENERATION_CONFIG,
     });
 
     // Invalid/unexpected model output => 502 upstream error. Unsupported
     // updates are simply dropped by the validator (the CRM field stays as-is).
-    const updates = normalizeCrmFieldUpdates(parseModelJson(text), fields, messages);
+    // Provider-agnostic: this validation is IDENTICAL for Gemini and OpenRouter.
+    const updates = normalizeCrmFieldUpdates(parseModelJson(extraction.text), fields, messages);
 
     return res.status(200).json({
       success: true,
-      model: GEMINI_MODEL,
+      // Additive metadata — which provider/model actually answered. All
+      // previously returned fields are unchanged (frontend contract intact).
+      provider: extraction.provider,
+      model: extraction.model,
       prompt_version: getPromptVersion(),
       contact_id: contactId,
       organization_id: organizationId,
@@ -183,7 +199,9 @@ app.post('/ai/extract-crm-fields', async (req: Request, res: Response) => {
     if (err instanceof CrmExtractionError) {
       return res.status(502).json({ success: false, error: err.message });
     }
-    if (err instanceof GeminiError) {
+    if (err instanceof AiProviderError) {
+      // Clean, secret-free provider failure (Gemini exhausted its retry and
+      // the OpenRouter fallback failed, or a single non-transient provider error).
       const status = err.status ?? 502;
       return res.status(status).json({ success: false, error: err.safeMessage });
     }
@@ -199,9 +217,10 @@ app.post('/ai/extract-crm-fields', async (req: Request, res: Response) => {
 //
 // Called by bright-worker (Supabase Edge Function) on every inbound message.
 // The pipeline loads the conversation transcript + the organization's CRM
-// schema, extracts the CRM values through Gemini and writes everything
-// server-side: contact_custom_values + the conservative contacts update.
-// (No contact_ai_insights write path — the AI fills CRM fields only.)
+// schema, extracts the CRM values through the AI provider chain (Gemini
+// primary → one transient retry → sequential OpenRouter fallback) and writes
+// everything server-side: contact_custom_values + the conservative contacts
+// update. (No contact_ai_insights write path — the AI fills CRM fields only.)
 //
 // Auth: optional shared secret — when WEBHOOK_SECRET is set, callers must
 // send it in the `x-webhook-secret` header (bright-worker does).
@@ -216,11 +235,17 @@ app.post('/ai/webhook/message', async (req: Request, res: Response) => {
     }
   }
 
-  const apiKey = process.env.GEMINI_API_KEY;
-  if (!apiKey) {
+  const geminiApiKey = process.env.GEMINI_API_KEY;
+  const openrouterApiKey = process.env.OPENROUTER_API_KEY;
+  // Same dev/test override as /ai/extract-crm-fields (server-side env only).
+  const forcesOpenRouter =
+    (process.env.AI_TEST_PROVIDER ?? '').trim().toLowerCase() === 'openrouter';
+  if (forcesOpenRouter ? !openrouterApiKey : !geminiApiKey) {
     return res.status(500).json({
       success: false,
-      error: 'GEMINI_API_KEY is not configured on the server.',
+      error: forcesOpenRouter
+        ? 'OPENROUTER_API_KEY is not configured on the server.'
+        : 'GEMINI_API_KEY is not configured on the server.',
     });
   }
 
@@ -237,17 +262,17 @@ app.post('/ai/webhook/message', async (req: Request, res: Response) => {
   }
 
   try {
-    const result = await processInboundMessage(apiKey, {
-      organizationId,
-      contactId,
-      conversationId,
-    });
+    const result = await processInboundMessage(
+      { geminiApiKey, openrouterApiKey },
+      { organizationId, contactId, conversationId },
+    );
     return res.status(200).json({ success: true, ...result });
   } catch (err) {
     if (err instanceof CrmExtractionError) {
       return res.status(502).json({ success: false, error: err.message });
     }
-    if (err instanceof GeminiError) {
+    if (err instanceof AiProviderError) {
+      // Clean, secret-free provider failure — status is already safe to show.
       const status = err.status ?? 502;
       return res.status(status).json({ success: false, error: err.safeMessage });
     }

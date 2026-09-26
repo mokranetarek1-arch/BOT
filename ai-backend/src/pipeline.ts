@@ -5,8 +5,9 @@
  * message. Steps:
  *   1. Load the contact, the conversation transcript (with message ids) and the
  *      organization's CRM schema (built-in contact columns + crm_custom_fields).
- *   2. Extract CRM values through Gemini — exactly the same prompt and
- *      validation as POST /ai/extract-crm-fields.
+ *   2. Extract CRM values through the AI provider chain (Gemini primary → one
+ *      transient retry → sequential OpenRouter free-model chain) — exactly the
+ *      same prompt and validation as POST /ai/extract-crm-fields.
  *   3. Persist the accepted updates:
  *        - public.contact_custom_values → organization-defined CRM fields,
  *          merged; a stored value is only replaced by a strong, evidence-backed
@@ -18,11 +19,12 @@
  * the CRM fields the organization defined instead of a separate "insights"
  * layer with fixed intent/interests/sentiment types.
  *
- * All DB access uses the service-role client; the API key never leaves gemini.ts.
+ * All DB access uses the service-role client; API keys never leave the server
+ * (provider.ts orchestrates gemini.ts / openrouter.ts — no key ever reaches a
+ * log line, a response payload or the frontend).
  */
 import { getSupabaseAdmin } from './supabaseAdmin';
-import { callGemini } from './gemini';
-import { GEMINI_MODEL } from './config';
+import { runExtraction, type AiKeys, type AiProvider } from './provider';
 import {
   buildCrmSchema,
   buildExtractionPrompt,
@@ -52,6 +54,8 @@ export interface ProcessMessageResult {
   organizationId: string;
   contactId: string;
   conversationId: string;
+  /** Which AI provider produced the extraction (gemini | openrouter). */
+  provider: AiProvider;
   transcript_messages: number;
   crm_fields_used: number;
   /** Every update the model produced and the validator accepted. */
@@ -243,10 +247,11 @@ async function applyContactUpdates(
 
 /**
  * Full automatic extraction pipeline for one inbound message:
- * transcript + CRM schema → Gemini → CRM fields (custom values + contact).
+ * transcript + CRM schema → AI provider chain → CRM fields (custom values +
+ * contact).
  */
 export async function processInboundMessage(
-  apiKey: string,
+  keys: AiKeys,
   params: ProcessMessageParams,
 ): Promise<ProcessMessageResult> {
   const { organizationId, contactId, conversationId } = params;
@@ -271,14 +276,24 @@ export async function processInboundMessage(
   const customFields = await loadCustomFields(sb, organizationId);
   const fields = buildCrmSchema(customFields);
 
-  // 3. Gemini extraction (same prompt/validation as /ai/extract-crm-fields).
-  const text = await callGemini({
-    apiKey,
-    model: GEMINI_MODEL,
+  // 3. AI extraction through the provider chain (Gemini primary → one transient
+  //    retry → sequential OpenRouter free models) — same prompt/validation as
+  //    /ai/extract-crm-fields. Whichever provider/model answers, its text goes
+  //    through the SAME parseModelJson + normalizeCrmFieldUpdates below.
+  const extraction = await runExtraction({
+    geminiApiKey: keys.geminiApiKey,
+    openrouterApiKey: keys.openrouterApiKey,
     prompt: buildExtractionPrompt(fields, messages),
     generationConfig: EXTRACTION_GENERATION_CONFIG,
+    // Runs INSIDE the chain for each OpenRouter model: invalid JSON / schema
+    // mismatch fails that model and the chain moves to the next free model.
+    // The result is re-validated below for every provider (incl. Gemini), so
+    // validation can never be bypassed.
+    validateModelText: (text) => {
+      normalizeCrmFieldUpdates(parseModelJson(text), fields, messages);
+    },
   });
-  const updates = normalizeCrmFieldUpdates(parseModelJson(text), fields, messages);
+  const updates = normalizeCrmFieldUpdates(parseModelJson(extraction.text), fields, messages);
 
   // 4. Persist — custom CRM fields first, then the built-in contact columns.
   const stored = await loadCustomValues(sb, contactId);
@@ -300,6 +315,7 @@ export async function processInboundMessage(
     organizationId,
     contactId,
     conversationId,
+    provider: extraction.provider,
     transcript_messages: messages.length,
     crm_fields_used: fields.length,
     updates,

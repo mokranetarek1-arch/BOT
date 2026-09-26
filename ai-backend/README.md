@@ -48,9 +48,18 @@ The server listens on `0.0.0.0` and uses `process.env.PORT || 3000`.
 | `WEBHOOK_SECRET` | No | Optional shared secret for `/ai/webhook/message` (`x-webhook-secret` header) |
 | `ALLOWED_ORIGINS` | No | Comma-separated browser origins allowed by CORS. Empty = any origin (the API is public and credential-less). |
 | `PORT` | No | HTTP port (defaults to 3000) |
+| `OPENROUTER_API_KEY` | No (fallback) | OpenRouter API key — enables the sequential fallback used ONLY when Gemini is temporarily unavailable (429/500/502/503/504/network/timeout, after one Gemini retry). The chain walks FREE OpenRouter models one at a time until the first valid response |
+| `OPENROUTER_BASE_URL` | No | OpenRouter REST base (defaults to `https://openrouter.ai/api/v1`) |
+| `OPENROUTER_TIMEOUT_MS` | No | Per-model attempt deadline in ms (defaults to `30000`) |
+| `OPENROUTER_MAX_MODELS` | No | Max free models tried per request (defaults to `3`) |
+| `OPENROUTER_FREE_MODELS` | No | Comma-separated explicit free model ids — overrides dynamic discovery |
+| `AI_TEST_PROVIDER` | No (dev only) | `gemini` or `openrouter` — forces a single provider path so each can be tested without a real Gemini outage. Never bypasses validation. Leave unset in production |
+| `AI_TEST_MODEL` | No (dev only) | Pins the single OpenRouter model to try. Leave unset in production |
 
 Secrets are read from the environment only — never hardcoded, logged, or
 returned in any response. `SUPABASE_SERVICE_ROLE_KEY` must never reach a browser.
+`GEMINI_API_KEY` and `OPENROUTER_API_KEY` are never sent to the frontend or
+stored in Supabase.
 
 ## 4. Test GET /health
 
@@ -248,7 +257,87 @@ Suggested Render configuration:
 | Root Directory | `ai-backend`                 |
 | Build Command  | `npm install && npm run build` |
 | Start Command  | `npm start`                  |
-| Env Vars       | `GEMINI_API_KEY`, `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`, optional `WEBHOOK_SECRET` |
+| Env Vars       | `GEMINI_API_KEY`, `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`, optional `WEBHOOK_SECRET`, optional `OPENROUTER_API_KEY` (+ optional `OPENROUTER_*` tuning vars), optional `AI_TEST_PROVIDER` / `AI_TEST_MODEL` (dev only) |
 
 Render injects `PORT` automatically — the server already binds to
 `0.0.0.0:$PORT` and does not hardcode localhost.
+
+## 9. Provider fallback: Gemini → OpenRouter free models
+
+Conversation analysis (CRM field extraction) runs through a strictly
+**sequential** provider chain — never parallel:
+
+1. **Gemini (primary)** — one attempt with the existing prompt, generation
+   config and timeout.
+2. **Gemini retry** — only for temporary provider problems (HTTP 429/500/502/
+   503/504, network error, timeout), once, after a short exponential backoff
+   (500 ms base). Non-transient errors (e.g. 400/401/404) surface immediately
+   with no retry and no fallback.
+3. **OpenRouter free models (fallback)** — only after Gemini failed transiently
+   twice, and only when `OPENROUTER_API_KEY` is set. Free models are discovered
+   dynamically from `GET /models` (pricing = 0 for prompt *and* completion,
+   text in/out), sorted deterministically by id and capped at
+   `OPENROUTER_MAX_MODELS`; each model gets its own `OPENROUTER_TIMEOUT_MS`
+   deadline. `OPENROUTER_FREE_MODELS` / `AI_TEST_MODEL` can pin the list
+   instead. The `openrouter/free` alias is never used (it would make the model
+   choice non-deterministic).
+4. Every model receives the *identical* prompt, and its raw output must pass
+   the *same* parse/validation (`parseModelJson` → `normalizeCrmFieldUpdates`)
+   **before** the chain accepts it — invalid JSON or a schema mismatch fails
+   that model and the chain moves to the next free model. Only accepted text
+   reaches the CRM write, so the extraction contract and stored data shape are
+   provider-independent.
+5. If every free model fails, the route returns a clean `AiProviderError`
+   (HTTP 503) naming the Gemini status — errors are never swallowed.
+
+Safe server-side log lines (provider, model, HTTP status, durations and
+attempt/fallback decisions only — never keys, prompts, messages, headers,
+customer data or model responses):
+
+```
+[ai-provider] attempt {"provider":"gemini","attempt":1}
+[ai-provider] retry {"provider":"gemini","next_attempt":2,"status":503,"delay_ms":500}
+[ai-provider] fallback_triggered {"from":"gemini","to":"openrouter","reason":"gemini_status_503"}
+[ai-provider] model_failed {"provider":"openrouter","model":"…","status":429,"duration_ms":120}
+[ai-provider] success {"provider":"openrouter","model":"…","fallback":true,"duration_ms":842}
+[ai-provider] chain_complete {"provider":"openrouter","model":"…","models_tried":2,"total_duration_ms":1450}
+```
+
+### Testing without a real Gemini outage
+
+Set `AI_TEST_PROVIDER` (server-side env var only — clients cannot set it):
+
+```bash
+# Exercise the OpenRouter fallback chain directly (Gemini is never called):
+AI_TEST_PROVIDER=openrouter curl -X POST http://localhost:3000/ai/extract-crm-fields \
+  -H 'Content-Type: application/json' -d '{"crm_fields":[...],"messages":[...]}'
+
+# Optionally pin ONE free model for that run (validation still applies):
+AI_TEST_PROVIDER=openrouter AI_TEST_MODEL=<free-model-id> curl …
+
+# Exercise the isolated Gemini primary path (no retry, no fallback):
+AI_TEST_PROVIDER=gemini
+```
+
+Production behavior requires leaving `AI_TEST_PROVIDER` unset. To verify a
+live Gemini-outage fallback end-to-end, temporarily set
+`AI_TEST_PROVIDER=openrouter` in a development environment, or rely on the
+logged `fallback_triggered` / `chain_complete` events when Gemini rate-limits
+you in production.
+
+Unit tests for the provider orchestration (mocked providers — no API keys and
+no network access required):
+
+```bash
+cd ai-backend
+npm test        # builds dist/ then runs node --test tests/
+```
+
+Covered: Gemini success (no fallback), Gemini retry, fallback chain order,
+per-model validation failure advancing to the next free model, all-models
+failure → clean HTTP 503, missing-key behavior, strict sequential execution
+(never parallel), and that API keys / conversation contents never appear in
+the logs.
+
+The Gemini connectivity route `POST /ai/test` still verifies the primary
+provider directly and can be used after every deploy.
