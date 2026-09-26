@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useState, type KeyboardEvent } from 'react';
 import { RefreshCw } from 'lucide-react';
 import { conversationService } from '@/services/conversationService';
 import { Conversation, Message } from '@/types';
@@ -34,6 +34,11 @@ export default function Inbox() {
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [messages, setMessages] = useState<Message[]>([]);
   const [messagesLoading, setMessagesLoading] = useState(false);
+  // Reply composer state (Inbox replies — the send itself runs server-side in
+  // the `send-message` Edge Function; the access token never reaches the browser).
+  const [draft, setDraft] = useState('');
+  const [sending, setSending] = useState(false);
+  const [sendError, setSendError] = useState<string | null>(null);
 
   // Initial load (effect): every setState lives in the promise chain —
   // nothing runs synchronously inside the effect body.
@@ -99,6 +104,44 @@ export default function Inbox() {
     setMessages([]);
     setMessagesLoading(true);
     setSelectedId(id);
+    setSendError(null);
+  };
+
+  // Send the current draft (event handler — synchronous setState is allowed).
+  // The outbound message is created by the Edge Function and appended to the
+  // thread; the conversation list is kept in sync so ordering stays correct.
+  const handleSend = () => {
+    const conversationId = selectedId;
+    const text = draft.trim();
+    if (!conversationId || !text || sending) return;
+
+    setSending(true);
+    setSendError(null);
+    conversationService
+      .sendMessage(conversationId, text)
+      .then((saved) => {
+        setMessages((prev) => [...prev, saved]);
+        setDraft('');
+        setConversations((prev) =>
+          prev.map((conversation) =>
+            conversation.id === conversationId
+              ? { ...conversation, last_message_at: saved.created_at }
+              : conversation,
+          ),
+        );
+      })
+      .catch((err) =>
+        setSendError(err instanceof Error ? err.message : 'Could not send the message.')
+      )
+      .finally(() => setSending(false));
+  };
+
+  // Enter sends (Shift+Enter is left free for future multi-line input).
+  const handleDraftKeyDown = (event: KeyboardEvent<HTMLInputElement>) => {
+    if (event.key === 'Enter' && !event.shiftKey) {
+      event.preventDefault();
+      handleSend();
+    }
   };
 
   return (
@@ -194,39 +237,67 @@ export default function Inbox() {
             </p>
           ) : (
             <div className="flex flex-col space-y-4">
-              {messages.map((message) => (
-                <div key={message.id} className="flex items-start">
-                  <div className="w-8 h-8 rounded-full bg-accent flex items-center justify-center mr-3 shrink-0 text-xs font-medium">
-                    {(message.sender_external_id?.slice(-2) ?? '??').toUpperCase()}
-                  </div>
-                  <div>
-                    <div className="bg-muted p-3 rounded-2xl rounded-tl-sm text-sm max-w-md break-words">
-                      {message.message_text ?? `[${message.message_type}]`}
+              {messages.map((message) => {
+                const isOutbound = message.direction === 'outbound';
+                return (
+                  <div
+                    key={message.id}
+                    className={`flex items-start ${isOutbound ? 'flex-row-reverse' : ''}`}
+                  >
+                    <div className="w-8 h-8 rounded-full bg-accent flex items-center justify-center mx-3 shrink-0 text-xs font-medium">
+                      {(message.sender_external_id?.slice(-2) ?? '??').toUpperCase()}
                     </div>
-                    <p className="mt-1 text-[10px] text-muted-foreground">
-                      {formatDate(message.created_at)} · inbound · {message.message_type}
-                    </p>
+                    <div className={isOutbound ? 'text-right' : ''}>
+                      <div
+                        className={`p-3 rounded-2xl text-sm max-w-md break-words ${
+                          isOutbound
+                            ? 'bg-primary text-primary-foreground rounded-tr-sm'
+                            : 'bg-muted rounded-tl-sm'
+                        }`}
+                      >
+                        {message.message_text ?? `[${message.message_type}]`}
+                      </div>
+                      <p className="mt-1 text-[10px] text-muted-foreground">
+                        {formatDate(message.created_at)} · {message.direction ?? 'inbound'} ·{' '}
+                        {message.message_type}
+                      </p>
+                    </div>
                   </div>
-                </div>
-              ))}
+                );
+              })}
             </div>
           )}
         </div>
         <div className="p-4 border-t bg-card shrink-0">
+          {sendError && (
+            <div className="mb-3 p-3 rounded-md bg-destructive/10 text-destructive text-sm font-medium">
+              {sendError}
+            </div>
+          )}
           <div className="flex gap-2">
             <input
               type="text"
-              disabled
-              placeholder="Outbound replies are not available yet (Phase 2)."
-              className="flex-1 h-10 rounded-md border border-input bg-transparent px-3 py-1 text-sm shadow-sm opacity-60"
+              value={draft}
+              onChange={(e) => setDraft(e.target.value)}
+              onKeyDown={handleDraftKeyDown}
+              disabled={!selected || sending}
+              maxLength={1000}
+              placeholder={
+                selected ? 'Write a reply and press Enter…' : 'Select a conversation to reply.'
+              }
+              className="flex-1 h-10 rounded-md border border-input bg-transparent px-3 py-1 text-sm shadow-sm disabled:opacity-60"
             />
             <button
-              disabled
-              className="h-10 px-4 rounded-md bg-primary text-primary-foreground text-sm font-medium opacity-50"
+              onClick={handleSend}
+              disabled={!selected || sending || !draft.trim()}
+              className="h-10 px-4 rounded-md bg-primary text-primary-foreground text-sm font-medium disabled:opacity-50"
             >
-              Send
+              {sending ? 'Sending…' : 'Send'}
             </button>
           </div>
+          <p className="mt-2 text-[10px] text-muted-foreground">
+            Instagram only allows replies within 24 hours of the customer&apos;s last message.
+          </p>
         </div>
       </div>
 
@@ -277,8 +348,9 @@ export default function Inbox() {
                 <p className="text-xs">{formatDate(selected.last_message_at)}</p>
               </div>
               <p className="text-xs text-muted-foreground pt-2 border-t">
-                Inbox Phase 1: inbound messages only. Outbound replies and AI features are not
-                included in this phase.
+                Replies are sent through the Instagram Messaging API — Instagram only allows
+                them within 24 hours of the customer&apos;s last message. CRM fields are filled
+                automatically by the AI backend.
               </p>
             </div>
           </>
