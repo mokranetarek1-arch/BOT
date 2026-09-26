@@ -9,6 +9,10 @@ interface ImportMetaEnv {
   readonly VITE_INSTAGRAM_REDIRECT_URI: string;
   /** Base URL of the AI backend (Render). No secrets — public URL only. */
   readonly VITE_AI_BACKEND_URL: string;
+  /** Meta App ID. Public — used to init the Meta JavaScript SDK. */
+  readonly VITE_FACEBOOK_APP_ID: string;
+  /** Facebook Login for Business configuration ID driving Embedded Signup. */
+  readonly VITE_FACEBOOK_CONFIG_ID: string;
 }
 
 interface ImportMeta {

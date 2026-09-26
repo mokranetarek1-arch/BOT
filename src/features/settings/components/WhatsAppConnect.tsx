@@ -48,6 +48,28 @@ export function WhatsAppConnect() {
     }
   };
 
+  /**
+   * One-click connect via Meta Embedded Signup: the user never types a
+   * Phone Number ID or an Access Token — Meta hands them to us directly.
+   */
+  const handleMetaSignup = async () => {
+    setSaving(true);
+    setError(null);
+    setSuccess(null);
+    try {
+      const saved = await whatsappService.connectWithEmbeddedSignup();
+      setAccount(saved);
+      setSuccess(`WhatsApp connected: ${saved.account_name ?? saved.external_account_id}`);
+    } catch (err: unknown) {
+      // A plain dismissal of the Meta dialog must not look like a failure.
+      const message = err instanceof Error ? err.message : 'Failed to connect WhatsApp.';
+      if (message.toLowerCase().includes('cancelled')) return;
+      setError(message);
+    } finally {
+      setSaving(false);
+    }
+  };
+
   const handleDisconnect = async () => {
     if (!account) return;
     setSaving(true);
@@ -79,13 +101,20 @@ export function WhatsAppConnect() {
             )}
           </div>
         </div>
-        <div>
+        <div className="flex items-center gap-2">
           {account ? (
             <button onClick={handleDisconnect} disabled={saving} className="h-9 px-4 rounded-md border border-red-200 text-red-600 hover:bg-red-50 text-sm font-medium disabled:opacity-50">
               {saving ? 'Disconnecting...' : 'Disconnect'}
             </button>
           ) : (
-            <button onClick={() => setIsModalOpen(true)} className="h-9 px-4 rounded-md border-input bg-background hover:bg-accent text-sm font-medium">Connect</button>
+            <>
+              <button onClick={handleMetaSignup} disabled={saving} className="h-9 px-4 rounded-md bg-green-600 hover:bg-green-700 text-white text-sm font-medium shadow-sm transition-colors disabled:opacity-50">
+                {saving ? 'Connecting...' : 'Connect with Meta'}
+              </button>
+              <button onClick={() => setIsModalOpen(true)} className="h-9 px-3 rounded-md border text-sm font-medium hover:bg-accent">
+                Manual
+              </button>
+            </>
           )}
         </div>
       </div>

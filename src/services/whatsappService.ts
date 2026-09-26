@@ -1,5 +1,6 @@
 import { supabase } from '@/utils/supabase';
 import { SocialAccount } from '../types';
+import { launchWhatsAppEmbeddedSignup } from './metaSdk';
 
 export interface WhatsAppConnectParams {
   phoneNumberId: string;
@@ -7,7 +8,73 @@ export interface WhatsAppConnectParams {
   accessToken: string;
 }
 
+export interface WhatsAppSignupAccount {
+  id: string | null;
+  external_account_id: string;
+  name: string | null;
+}
+
+interface SignupEdgeResult {
+  ok?: boolean;
+  error?: string;
+  account?: WhatsAppSignupAccount;
+}
+
 export const whatsappService = {
+  /**
+   * Connect WhatsApp through Meta Embedded Signup (no IDs, no tokens to paste).
+   *
+   * Opens the Meta dialog, then immediately forwards the exchangeable code to
+   * the `facebook-oauth` Edge Function. The code has a ~30 second TTL, so the
+   * request must not be delayed, retried or queued.
+   */
+  async connectWithEmbeddedSignup(): Promise<SocialAccount> {
+    const { data: sessionData } = await supabase.auth.getSession();
+    const jwt = sessionData.session?.access_token;
+    if (!jwt) throw new Error('You must be signed in to connect WhatsApp.');
+
+    const { code, whatsappBusinessId, phoneNumberId } =
+      await launchWhatsAppEmbeddedSignup();
+
+    const { data, error } = await supabase.functions.invoke('facebook-oauth', {
+      body: {
+        action: 'whatsapp_signup',
+        code,
+        whatsapp_business_id: whatsappBusinessId,
+        phone_number_id: phoneNumberId,
+      },
+      headers: { Authorization: `Bearer ${jwt}` },
+    });
+
+    if (error) {
+      const fnError = error as { message: string; name?: string; context?: Response };
+      let detail = '';
+      if (fnError.context) {
+        try {
+          const body = await fnError.context.clone().json();
+          detail = body?.error ? `: ${body.error}` : '';
+        } catch {
+          detail = '';
+        }
+      }
+      throw new Error(
+        `${fnError.message || 'The WhatsApp sign-up could not be completed.'}${detail}`,
+      );
+    }
+
+    const result = (data ?? {}) as SignupEdgeResult;
+    if (result.error) throw new Error(result.error);
+    if (!result.ok) throw new Error('Meta did not confirm the WhatsApp sign-up.');
+
+    const account = await this.getConnectedAccount();
+    if (!account) {
+      throw new Error(
+        'WhatsApp was connected but the account could not be read back. Check the Edge Function logs.',
+      );
+    }
+    return account;
+  },
+
   /**
    * Fetch connected WhatsApp account for current user
    */

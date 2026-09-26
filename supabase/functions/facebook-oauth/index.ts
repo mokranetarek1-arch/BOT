@@ -280,6 +280,175 @@ Deno.serve(async (req: Request) => {
     }
   }
 
+  if (action === 'whatsapp_signup') {
+    // Meta Embedded Signup (WhatsApp). The client sends the short-lived
+    // exchangeable code returned by FB.login. Per Meta's docs this code has a
+    // ~30s TTL, so it is exchanged immediately, on this first request.
+    const code = body['code'] as string;
+    if (!code) return json({ error: 'code is required.' }, 400);
+
+    const wabaIdFromClient = body['whatsapp_business_id'] as string | undefined;
+    const phoneIdFromClient = body['phone_number_id'] as string | undefined;
+
+    try {
+      // Step 1 — exchange the code for a business (system user) token.
+      const tokenUrl = new URL('https://graph.facebook.com/v22.0/oauth/access_token');
+      tokenUrl.searchParams.set('client_id', cfg.appId);
+      tokenUrl.searchParams.set('client_secret', cfg.appSecret);
+      tokenUrl.searchParams.set('code', code);
+
+      const tokenRes = await fetch(tokenUrl.toString());
+      const tokenData = await tokenRes.json();
+      if (!tokenRes.ok || tokenData.error) {
+        throw new Error(
+          `Could not exchange the Embedded Signup code: ${tokenData.error?.message ?? tokenRes.status}`,
+        );
+      }
+      const businessToken = String(tokenData.access_token);
+
+      // Step 2 — resolve the WABA and the business phone number. The client
+      // usually returns both, but we fall back to the API so that a partial
+      // response still connects.
+      let wabaId = wabaIdFromClient ?? null;
+      let phoneNumberId = phoneIdFromClient ?? null;
+
+      if (!wabaId) {
+        const wabaUrl = new URL(
+          'https://graph.facebook.com/v22.0/me/owned_whatsapp_business_accounts',
+        );
+        wabaUrl.searchParams.set('fields', 'id,name');
+        wabaUrl.searchParams.set('access_token', businessToken);
+        const wabaRes = await fetch(wabaUrl.toString());
+        const wabaData = await wabaRes.json();
+        const firstWaba = Array.isArray(wabaData.data) ? wabaData.data[0] : null;
+        if (!firstWaba) {
+          throw new Error(
+            'No WhatsApp Business Account was found for this Meta account.',
+          );
+        }
+        wabaId = String(firstWaba.id);
+      }
+
+      let displayName: string | null = null;
+      let displayPhone: string | null = null;
+
+      if (!phoneNumberId) {
+        const phoneUrl = new URL(
+          `https://graph.facebook.com/v22.0/${wabaId}/phone_numbers`,
+        );
+        phoneUrl.searchParams.set('fields', 'id,display_phone_number,verified_name');
+        phoneUrl.searchParams.set('access_token', businessToken);
+        const phoneRes = await fetch(phoneUrl.toString());
+        const phoneData = await phoneRes.json();
+        const firstPhone = Array.isArray(phoneData.data) ? phoneData.data[0] : null;
+        if (!firstPhone) {
+          throw new Error('No phone number is registered on this WhatsApp Business Account.');
+        }
+        phoneNumberId = String(firstPhone.id);
+        displayPhone = firstPhone.display_phone_number ?? null;
+        displayName = firstPhone.verified_name ?? null;
+      } else {
+        // Confirm the number details for a better account label.
+        try {
+          const infoUrl = new URL(`https://graph.facebook.com/v22.0/${phoneNumberId}`);
+          infoUrl.searchParams.set('fields', 'display_phone_number,verified_name');
+          infoUrl.searchParams.set('access_token', businessToken);
+          const infoRes = await fetch(infoUrl.toString());
+          const infoData = await infoRes.json();
+          displayPhone = infoData.display_phone_number ?? null;
+          displayName = infoData.verified_name ?? null;
+        } catch {
+          // Non-fatal: the account can still be stored with a generic name.
+        }
+      }
+
+      // Step 3 — register the number for Cloud API and subscribe webhooks.
+      // Both are best-effort: the business token is already usable to send.
+      try {
+        const regUrl = new URL(
+          `https://graph.facebook.com/v22.0/${phoneNumberId}/register`,
+        );
+        regUrl.searchParams.set('access_token', businessToken);
+        await fetch(regUrl.toString(), {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ messaging_product: 'whatsapp' }),
+        });
+      } catch (e) {
+        console.warn('[whatsapp-signup] number registration warning:', e);
+      }
+
+      try {
+        const subUrl = new URL(
+          `https://graph.facebook.com/v22.0/${wabaId}/subscribed_apps`,
+        );
+        subUrl.searchParams.set('access_token', businessToken);
+        const subRes = await fetch(subUrl.toString(), { method: 'POST' });
+        if (!subRes.ok) {
+          console.warn('[whatsapp-signup] webhook subscription returned', subRes.status);
+        }
+      } catch (e) {
+        console.warn('[whatsapp-signup] webhook subscription warning:', e);
+      }
+
+      // Step 4 — persist the account for this organization.
+      const accountName = displayName || displayPhone || `WhatsApp ${phoneNumberId}`;
+
+      const columns = await getSocialAccountColumns(admin);
+      const row: Record<string, unknown> = {};
+      if (columns.has('organization_id')) row.organization_id = organizationId;
+      if (columns.has('platform')) row.platform = 'whatsapp';
+      if (columns.has('external_account_id')) {
+        row.external_account_id = String(phoneNumberId);
+      }
+      if (columns.has('account_name')) row.account_name = accountName;
+
+      if (columns.has('access_token_encrypted')) {
+        row.access_token_encrypted = businessToken;
+      } else if (columns.has('access_token')) {
+        row.access_token = businessToken;
+      } else {
+        return json(
+          {
+            error:
+              'social_accounts has no access_token / access_token_encrypted column — the token was never stored.',
+            hint: 'Add the column, then reconnect WhatsApp.',
+          },
+          500,
+        );
+      }
+      if (columns.has('connected_at')) row.connected_at = new Date().toISOString();
+
+      const { data: saved, error: upsertError } = await admin
+        .from('social_accounts')
+        .upsert(row, { onConflict: 'organization_id,platform,external_account_id' })
+        .select('*')
+        .single();
+
+      if (upsertError) {
+        return json(
+          { error: `Failed to save the WhatsApp account: ${upsertError.message}` },
+          500,
+        );
+      }
+
+      return json({
+        ok: true,
+        account: {
+          id: saved?.id ?? null,
+          external_account_id: String(phoneNumberId),
+          name: accountName,
+        },
+      });
+    } catch (e) {
+      console.error('[whatsapp-signup] error:', e);
+      return json(
+        { error: e instanceof Error ? e.message : 'Unknown WhatsApp sign-up error.' },
+        502,
+      );
+    }
+  }
+
   if (action === 'select_page') {
     const userAccessToken = body['user_access_token'] as string;
     const pageId = body['page_id'] as string;
