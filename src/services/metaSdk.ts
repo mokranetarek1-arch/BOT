@@ -11,6 +11,8 @@
  * ~30 second TTL, so callers must forward it immediately.
  */
 
+import { META_PUBLIC } from '../config/metaPublic';
+
 /** Graph API version shared with the server-side calls. */
 const GRAPH_VERSION = 'v22.0';
 const SDK_SRC = 'https://connect.facebook.net/en_US/sdk.js';
@@ -35,7 +37,7 @@ interface FBResponse {
 }
 
 type FBApi = {
-  init: (options: { xfbml?: boolean; version: string }) => void;
+  init: (options: { xfbml?: boolean; version: string; appId?: string }) => void;
   login: (
     callback: (response: FBResponse) => void,
     options?: Record<string, unknown>,
@@ -55,22 +57,28 @@ let sdkPromise: Promise<void> | null = null;
 export function loadFacebookSdk(): Promise<void> {
   if (sdkPromise) return sdkPromise;
 
+  const { appId } = META_PUBLIC;
+  // The SDK discovers the app through the script URL fragment, the
+  // data-app-id attribute or FB.init(). We set all three so it resolves the
+  // app whichever one it looks at first.
+  const initOptions = { xfbml: false, version: GRAPH_VERSION, appId };
+
   sdkPromise = new Promise<void>((resolve, reject) => {
     // The SDK mounts its dialog into #fb-root, declared in index.html.
-    if (document.getElementById('fb-root') === null) {
-      const root = document.createElement('div');
-      root.id = 'fb-root';
-      document.body.appendChild(root);
-    }
+    const root =
+      document.getElementById('fb-root') ??
+      Object.assign(document.createElement('div'), { id: 'fb-root' });
+    if (root.parentNode === null) document.body.appendChild(root);
+    if (appId) root.setAttribute('data-app-id', appId);
 
     if (window.FB) {
-      window.FB.init({ xfbml: false, version: GRAPH_VERSION });
+      window.FB.init(initOptions);
       resolve();
       return;
     }
 
     window.fbAsyncInit = () => {
-      window.FB?.init({ xfbml: false, version: GRAPH_VERSION });
+      window.FB?.init(initOptions);
       resolve();
     };
 
@@ -78,7 +86,9 @@ export function loadFacebookSdk(): Promise<void> {
     script.async = true;
     script.defer = true;
     script.crossOrigin = 'anonymous';
-    script.src = SDK_SRC;
+    script.src = appId
+      ? `${SDK_SRC}#xfbml=false&version=${GRAPH_VERSION}&appId=${appId}`
+      : SDK_SRC;
     script.onerror = () => {
       sdkPromise = null;
       reject(
@@ -101,17 +111,17 @@ export function loadFacebookSdk(): Promise<void> {
  * callers can stay silent instead of showing a scary message.
  */
 export async function launchWhatsAppEmbeddedSignup(): Promise<EmbeddedSignupResult> {
-  const appId = import.meta.env.VITE_FACEBOOK_APP_ID;
-  const configId = import.meta.env.VITE_FACEBOOK_CONFIG_ID;
+  // Falls back to the committed public values in src/config/metaPublic.ts.
+  const { appId, configId } = META_PUBLIC;
 
   if (!appId) {
     throw new Error(
-      'VITE_FACEBOOK_APP_ID is missing. Add your Meta App ID to the .env file and restart the dev server.',
+      'No Meta App ID is configured. Set VITE_FACEBOOK_APP_ID or META_APP_ID in src/config/metaPublic.ts.',
     );
   }
   if (!configId) {
     throw new Error(
-      'VITE_FACEBOOK_CONFIG_ID is missing. Create a "WhatsApp Embedded Signup" configuration in the Meta dashboard (Facebook Login for Business > Configurations) and add its ID to the .env file.',
+      'No Facebook Login for Business configuration ID is set. Create a "WhatsApp Embedded Signup" configuration in the Meta dashboard, then set VITE_FACEBOOK_CONFIG_ID or META_CONFIG_ID.',
     );
   }
 
