@@ -518,7 +518,9 @@ export default function Inbox() {
             </button>
           </div>
           <p className="mt-2 text-[10px] text-muted-foreground">
-            Instagram only allows replies within 24 hours of the customer&apos;s last message.
+            {selected?.channel === 'facebook'
+              ? 'Facebook allows replies within 24 hours of the customer\'s last message.'
+              : 'Instagram only allows replies within 24 hours of the customer\'s last message.'}
           </p>
         </div>
       </div>
@@ -570,9 +572,7 @@ export default function Inbox() {
                 <p className="text-xs">{formatDate(selected.last_message_at)}</p>
               </div>
               <p className="text-xs text-muted-foreground pt-2 border-t">
-                Replies are sent through the Instagram Messaging API — Instagram only allows
-                them within 24 hours of the customer&apos;s last message. CRM fields are filled
-                automatically by the AI backend.
+                Replies are sent through the {selected.channel === 'facebook' ? 'Facebook Messenger API' : 'Instagram Messaging API'} — replies are allowed within 24 hours of the customer&apos;s last message. CRM fields are filled automatically by the AI backend.
               </p>
             </div>
           </>
