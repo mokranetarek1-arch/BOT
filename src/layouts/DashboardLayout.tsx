@@ -3,10 +3,29 @@ import { useEffect, useState } from 'react';
 import { MessageSquare, LayoutDashboard, Users, UserPlus, Settings, LineChart, BrainCircuit, LogOut } from 'lucide-react';
 import { supabase } from '@/utils/supabase';
 import { Button } from '@/components/ui/button';
+import { conversationService } from '@/services/conversationService';
+import { readStateService } from '@/services/readStateService';
 
 export default function DashboardLayout() {
   const navigate = useNavigate();
   const [userEmail, setUserEmail] = useState<string | null>(null);
+  const [unreadCount, setUnreadCount] = useState(0);
+
+  // Function to calculate unread count across conversations
+  const refreshUnreadCount = async () => {
+    try {
+      const convs = await conversationService.getConversations();
+      let count = 0;
+      for (const c of convs) {
+        if (readStateService.isUnread(c.id, c.last_message_at)) {
+          count++;
+        }
+      }
+      setUnreadCount(count);
+    } catch {
+      // Ignore background fetch errors
+    }
+  };
 
   useEffect(() => {
     // Check if user is authenticated
@@ -16,6 +35,7 @@ export default function DashboardLayout() {
         navigate('/auth/login');
       } else {
         setUserEmail(session.user.email ?? 'User');
+        refreshUnreadCount();
       }
     };
 
@@ -27,11 +47,21 @@ export default function DashboardLayout() {
         navigate('/auth/login');
       } else {
         setUserEmail(session.user.email ?? 'User');
+        refreshUnreadCount();
       }
     });
 
+    // Listen to read state changes
+    const onReadUpdate = () => refreshUnreadCount();
+    window.addEventListener('botd-read-state-updated', onReadUpdate);
+
+    // Poll for new messages every 15 seconds
+    const interval = setInterval(refreshUnreadCount, 15000);
+
     return () => {
       authListener.subscription.unsubscribe();
+      window.removeEventListener('botd-read-state-updated', onReadUpdate);
+      clearInterval(interval);
     };
   }, [navigate]);
 
@@ -51,8 +81,16 @@ export default function DashboardLayout() {
           <Link to="/dashboard" className="flex items-center gap-3 px-3 py-2 rounded-md hover:bg-accent text-sm">
             <LayoutDashboard size={18} /> Dashboard
           </Link>
-          <Link to="/inbox" className="flex items-center gap-3 px-3 py-2 rounded-md hover:bg-accent text-sm">
-            <MessageSquare size={18} /> Inbox
+          <Link to="/inbox" className="flex items-center justify-between px-3 py-2 rounded-md hover:bg-accent text-sm">
+            <div className="flex items-center gap-3">
+              <MessageSquare size={18} />
+              <span>Inbox</span>
+            </div>
+            {unreadCount > 0 && (
+              <span className="px-2 py-0.5 text-xs font-bold rounded-full bg-blue-600 text-white animate-pulse">
+                {unreadCount > 99 ? '99+' : unreadCount}
+              </span>
+            )}
           </Link>
           <div className="pt-4 pb-1">
             <p className="px-3 text-xs font-medium text-muted-foreground uppercase tracking-wider">CRM</p>

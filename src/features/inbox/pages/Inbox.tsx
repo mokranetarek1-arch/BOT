@@ -1,6 +1,7 @@
-import { useEffect, useState, type KeyboardEvent } from 'react';
+import { useEffect, useState, useRef, type KeyboardEvent } from 'react';
 import { RefreshCw, FileText, Download } from 'lucide-react';
 import { conversationService } from '@/services/conversationService';
+import { readStateService } from '@/services/readStateService';
 import { Conversation, Message } from '@/types';
 
 interface AttachmentItem {
@@ -162,6 +163,16 @@ export default function Inbox() {
   const [sending, setSending] = useState(false);
   const [sendError, setSendError] = useState<string | null>(null);
 
+  // Reference to the bottom of the chat thread for auto-scrolling
+  const messagesEndRef = useRef<HTMLDivElement | null>(null);
+
+  // State to force re-render when read state changes (e.g. user selects a conv)
+  const [, setReadTick] = useState(0);
+
+  const scrollToBottom = (behavior: ScrollBehavior = 'smooth') => {
+    messagesEndRef.current?.scrollIntoView({ behavior });
+  };
+
   // Initial load (effect): every setState lives in the promise chain —
   // nothing runs synchronously inside the effect body.
   useEffect(() => {
@@ -182,6 +193,26 @@ export default function Inbox() {
     return () => {
       cancelled = true;
     };
+  }, []);
+  // Listen to read state updates (e.g. from other components or tabs)
+  useEffect(() => {
+    const handleReadUpdate = () => setReadTick((prev) => prev + 1);
+    window.addEventListener('botd-read-state-updated', handleReadUpdate);
+    return () => {
+      window.removeEventListener('botd-read-state-updated', handleReadUpdate);
+    };
+  }, []);
+
+  // Poll conversations every 10 seconds to detect new incoming messages in real-time
+  useEffect(() => {
+    const interval = setInterval(() => {
+      conversationService
+        .getConversations()
+        .then((list) => setConversations(list))
+        .catch(() => {});
+    }, 10000);
+
+    return () => clearInterval(interval);
   }, []);
 
   // Manual refresh (event handler — synchronous setState is allowed here).
@@ -207,7 +238,12 @@ export default function Inbox() {
     conversationService
       .getMessages(selectedId)
       .then((list) => {
-        if (!cancelled) setMessages(list);
+        if (!cancelled) {
+          setMessages(list);
+          // Mark this conversation as read
+          readStateService.markAsRead(selectedId);
+          setReadTick((prev) => prev + 1);
+        }
       })
       .catch((err) => {
         if (!cancelled) {
@@ -222,11 +258,21 @@ export default function Inbox() {
     };
   }, [selectedId]);
 
+  // Scroll to bottom whenever messages finish loading or a new message arrives
+  useEffect(() => {
+    if (messages.length > 0 && !messagesLoading) {
+      // Use instant scroll on initial conversation open, smooth on new message
+      scrollToBottom('auto');
+    }
+  }, [messages, messagesLoading]);
+
   const handleSelect = (id: string) => {
     setMessages([]);
     setMessagesLoading(true);
     setSelectedId(id);
     setSendError(null);
+    readStateService.markAsRead(id);
+    setReadTick((prev) => prev + 1);
   };
 
   // Send the current draft (event handler — synchronous setState is allowed).
@@ -294,37 +340,70 @@ export default function Inbox() {
               No conversations yet — incoming Instagram DMs will appear here.
             </p>
           ) : (
-            conversations.map((conversation) => (
-              <button
-                key={conversation.id}
-                onClick={() => handleSelect(conversation.id)}
-                className={`w-full text-left p-3 mb-2 rounded-lg cursor-pointer border ${
-                  conversation.id === selectedId
-                    ? 'bg-accent text-accent-foreground border-input'
-                    : 'hover:bg-accent hover:text-accent-foreground border-transparent'
-                }`}
-              >
-                <div className="flex justify-between items-center mb-1">
-                  <span className="font-semibold text-sm truncate">
-                    {conversation.contact?.name ?? 'Unknown contact'}
-                  </span>
-                  <span className="text-xs text-muted-foreground shrink-0 ml-2">
-                    {formatTime(conversation.last_message_at)}
-                  </span>
-                </div>
-                <p className="text-xs text-muted-foreground truncate">
-                  {previewOf(conversation)}
-                </p>
-                <span
-                  className={`mt-1 inline-block px-1.5 py-0.5 rounded text-[10px] font-medium ${
-                    channelBadgeClasses[conversation.channel] ??
-                    'bg-secondary text-secondary-foreground'
+            conversations.map((conversation) => {
+              const isSelected = conversation.id === selectedId;
+              const isUnread = !isSelected && readStateService.isUnread(conversation.id, conversation.last_message_at);
+
+              return (
+                <button
+                  key={conversation.id}
+                  onClick={() => handleSelect(conversation.id)}
+                  className={`w-full text-left p-3 mb-2 rounded-lg cursor-pointer border transition-colors relative ${
+                    isSelected
+                      ? 'bg-accent text-accent-foreground border-input'
+                      : 'hover:bg-accent/60 hover:text-accent-foreground border-transparent'
                   }`}
                 >
-                  {conversation.channel}
-                </span>
-              </button>
-            ))
+                  <div className="flex justify-between items-center mb-1">
+                    <div className="flex items-center gap-2 min-w-0 pr-1">
+                      {/* Instagram-style blue unread indicator dot */}
+                      {isUnread && (
+                        <span
+                          className="w-2.5 h-2.5 rounded-full bg-blue-600 shrink-0"
+                          title="Nouveau message non lu"
+                        />
+                      )}
+                      <span
+                        className={`text-sm truncate ${
+                          isUnread ? 'font-bold text-foreground' : 'font-medium'
+                        }`}
+                      >
+                        {conversation.contact?.name ?? 'Unknown contact'}
+                      </span>
+                    </div>
+                    <span
+                      className={`text-xs shrink-0 ml-2 ${
+                        isUnread ? 'font-semibold text-blue-600 dark:text-blue-400' : 'text-muted-foreground'
+                      }`}
+                    >
+                      {formatTime(conversation.last_message_at)}
+                    </span>
+                  </div>
+                  <p
+                    className={`text-xs truncate ${
+                      isUnread ? 'font-semibold text-foreground' : 'text-muted-foreground'
+                    }`}
+                  >
+                    {previewOf(conversation)}
+                  </p>
+                  <div className="flex items-center justify-between mt-1">
+                    <span
+                      className={`inline-block px-1.5 py-0.5 rounded text-[10px] font-medium ${
+                        channelBadgeClasses[conversation.channel] ??
+                        'bg-secondary text-secondary-foreground'
+                      }`}
+                    >
+                      {conversation.channel}
+                    </span>
+                    {isUnread && (
+                      <span className="text-[10px] font-semibold text-blue-600 dark:text-blue-400">
+                        Nouveau
+                      </span>
+                    )}
+                  </div>
+                </button>
+              );
+            })
           )}
         </div>
       </div>
@@ -406,6 +485,8 @@ export default function Inbox() {
                   </div>
                 );
               })}
+              {/* Invisible anchor element to scroll down to */}
+              <div ref={messagesEndRef} />
             </div>
           )}
         </div>
