@@ -228,6 +228,98 @@ function parseFacebookEvent(entry: Record<string, unknown>): NormalizedEvent[] {
 }
 
 // ---------------------------------------------------------------------------
+// WHATSAPP PARSER
+// WhatsApp Cloud API sends payloads with object: "whatsapp_business_account".
+// The messages are nested under entry[].changes[].value.messages[].
+// The phone_number_id is in entry[].changes[].value.metadata.phone_number_id.
+// ---------------------------------------------------------------------------
+
+function parseWhatsAppEvent(entry: Record<string, unknown>): NormalizedEvent[] {
+  const events: NormalizedEvent[] = [];
+
+  const changes = entry['changes'] as Record<string, unknown>[] | undefined;
+  if (!Array.isArray(changes)) return events;
+
+  for (const change of changes) {
+    const value = change['value'] as Record<string, unknown> | undefined;
+    if (!value) continue;
+
+    const metadata = value['metadata'] as Record<string, unknown> | undefined;
+    const phoneNumberId = (metadata?.['phone_number_id'] as string) ?? '';
+
+    const contacts = value['contacts'] as Record<string, unknown>[] | undefined;
+    const contactMap = new Map<string, string>();
+    if (Array.isArray(contacts)) {
+      for (const c of contacts) {
+        const waId = c['wa_id'] as string | undefined;
+        const profile = c['profile'] as Record<string, unknown> | undefined;
+        const name = profile?.['name'] as string | undefined;
+        if (waId && name) {
+          contactMap.set(waId, name);
+        }
+      }
+    }
+
+    const messages = value['messages'] as Record<string, unknown>[] | undefined;
+    if (!Array.isArray(messages)) continue;
+
+    for (const msg of messages) {
+      const from = (msg['from'] as string) ?? '';
+      const messageId = (msg['id'] as string) ?? '';
+      if (!from || !messageId) continue;
+
+      const type = (msg['type'] as string) ?? 'unknown';
+      let messageText: string | null = null;
+      let messageType = type;
+      const attachments: Array<Record<string, unknown>> = [];
+
+      if (type === 'text') {
+        const textObj = msg['text'] as Record<string, unknown> | undefined;
+        messageText = (textObj?.['body'] as string) ?? null;
+      } else if (type === 'image' || type === 'video' || type === 'audio' || type === 'document') {
+        const mediaObj = msg[type] as Record<string, unknown> | undefined;
+        if (mediaObj) {
+          attachments.push({
+            type,
+            id: mediaObj['id'] ?? null,
+            mime_type: mediaObj['mime_type'] ?? null,
+            caption: mediaObj['caption'] ?? null,
+          });
+          if (typeof mediaObj['caption'] === 'string') {
+            messageText = mediaObj['caption'];
+          }
+        }
+      }
+
+      const timestampSeconds = Number(msg['timestamp'] ?? Date.now() / 1000);
+      const timestampMs = Math.floor(timestampSeconds * 1000);
+
+      const senderName = contactMap.get(from) ?? null;
+      const profileData: Record<string, unknown> = {};
+      if (senderName) {
+        profileData['name'] = senderName;
+      }
+
+      events.push({
+        channel: 'whatsapp',
+        social_account_external_id: phoneNumberId,
+        external_user_id: from,
+        external_conversation_id: null,
+        external_message_id: messageId,
+        message_text: messageText,
+        message_type: messageType,
+        attachments,
+        profile_data: profileData,
+        raw_data: msg,
+        timestamp_ms: timestampMs,
+      });
+    }
+  }
+
+  return events;
+}
+
+// ---------------------------------------------------------------------------
 // CRM PERSISTENCE
 // Idempotent: find-or-create for contacts, channel identities, conversations.
 // Messages are inserted once per external_message_id.
@@ -790,17 +882,21 @@ Deno.serve(async (req: Request) => {
     // never delay the response with long processing.
     const persistence: Promise<void>[] = [];
     for (const entry of entries) {
-      if (objectType !== 'instagram' && objectType !== 'page') {
+      if (objectType !== 'instagram' && objectType !== 'page' && objectType !== 'whatsapp_business_account') {
         console.log(
           `EVENT_TYPE: unsupported_object:${objectType} (skipped — not a messaging event, nothing stored as a message)`,
         );
         continue;
       }
 
-      const normalizedEvents: NormalizedEvent[] =
-        objectType === 'instagram'
-          ? parseInstagramEvent(entry)
-          : parseFacebookEvent(entry);
+      let normalizedEvents: NormalizedEvent[] = [];
+      if (objectType === 'instagram') {
+        normalizedEvents = parseInstagramEvent(entry);
+      } else if (objectType === 'page') {
+        normalizedEvents = parseFacebookEvent(entry);
+      } else if (objectType === 'whatsapp_business_account') {
+        normalizedEvents = parseWhatsAppEvent(entry);
+      }
 
       for (const event of normalizedEvents) {
         persistence.push(persistEvent(supabase, event, defaultOrgId));

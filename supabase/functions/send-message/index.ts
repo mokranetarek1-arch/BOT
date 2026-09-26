@@ -362,7 +362,8 @@ Deno.serve(async (req: Request) => {
   if (!conversation) return json({ error: 'Conversation not found.' }, 404);
 
   const isFacebook = conversation.channel === 'facebook';
-  if (conversation.channel !== 'instagram' && !isFacebook) {
+  const isWhatsApp = conversation.channel === 'whatsapp';
+  if (conversation.channel !== 'instagram' && !isFacebook && !isWhatsApp) {
     return json(
       { error: `Replying is not supported on the "${conversation.channel}" channel yet.` },
       400,
@@ -445,9 +446,11 @@ Deno.serve(async (req: Request) => {
   if (windowError) return json({ error: windowError }, 409);
 
   // ---- Send through Meta ------------------------------------------------
-  const endpoint = isFacebook
-    ? 'https://graph.facebook.com/v22.0/me/messages'
-    : `${resolveGraphBase().base}/${encodeURIComponent(accountExternalId)}/messages`;
+  const endpoint = isWhatsApp
+    ? `https://graph.facebook.com/v22.0/${encodeURIComponent(accountExternalId)}/messages`
+    : isFacebook
+      ? 'https://graph.facebook.com/v22.0/me/messages'
+      : `${resolveGraphBase().base}/${encodeURIComponent(accountExternalId)}/messages`;
 
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), SEND_TIMEOUT_MS);
@@ -455,12 +458,23 @@ Deno.serve(async (req: Request) => {
   let res: Response;
   let payload: unknown = null;
   try {
-    const reqBody: Record<string, unknown> = {
-      recipient: { id: recipientId },
-      message: { text },
-    };
-    if (isFacebook) {
-      reqBody.messaging_type = 'RESPONSE';
+    let reqBody: Record<string, unknown>;
+    if (isWhatsApp) {
+      reqBody = {
+        messaging_product: 'whatsapp',
+        recipient_type: 'individual',
+        to: recipientId,
+        type: 'text',
+        text: { body: text },
+      };
+    } else {
+      reqBody = {
+        recipient: { id: recipientId },
+        message: { text },
+      };
+      if (isFacebook) {
+        reqBody.messaging_type = 'RESPONSE';
+      }
     }
 
     res = await fetch(endpoint, {
@@ -505,7 +519,10 @@ Deno.serve(async (req: Request) => {
   const metaMessageId =
     typeof (payload as { message_id?: unknown } | null)?.message_id === 'string'
       ? String((payload as { message_id: string }).message_id)
-      : '';
+      : Array.isArray((payload as { messages?: unknown[] } | null)?.messages) &&
+        typeof ((payload as { messages: Record<string, unknown>[] }).messages[0]?.id) === 'string'
+        ? String((payload as { messages: Record<string, unknown>[] }).messages[0].id)
+        : '';
   const recipientConfirmed =
     typeof (payload as { recipient_id?: unknown } | null)?.recipient_id === 'string'
       ? String((payload as { recipient_id: string }).recipient_id)
