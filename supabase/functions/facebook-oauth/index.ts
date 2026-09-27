@@ -31,6 +31,15 @@ function getConfig(): { appId: string; appSecret: string } {
   return { appId, appSecret };
 }
 
+/**
+ * Optional-column detection for `social_accounts`.
+ *
+ * The exact schema of public.social_accounts is not frozen in this repo, so
+ * every optional column is probed before it is written (the same pattern
+ * bright-worker and send-message use) instead of being assumed. WhatsApp adds
+ * waba_id / phone_number / display_name / is_active on top of the shared
+ * columns; those are additive and therefore optional here.
+ */
 async function getSocialAccountColumns(
   admin: ReturnType<typeof createClient>,
 ): Promise<Set<string>> {
@@ -43,6 +52,10 @@ async function getSocialAccountColumns(
     'access_token',
     'access_token_encrypted',
     'connected_at',
+    'waba_id',
+    'phone_number',
+    'display_name',
+    'is_active',
   ];
   const existing = new Set<string>();
   for (const col of candidates) {
@@ -306,61 +319,78 @@ Deno.serve(async (req: Request) => {
       }
       const businessToken = String(tokenData.access_token);
 
-      // Step 2 — resolve the WABA and the business phone number. The client
-      // usually returns both, but we fall back to the API so that a partial
-      // response still connects.
+      // Step 2 — resolve the WABA and the business phone number.
+      //
+      // The client usually returns both, but they are treated as HINTS only:
+      // the WABA is resolved from the freshly exchanged business token, and the
+      // phone number is resolved from the WABA itself. A client-supplied pair is
+      // never trusted to be "connected" on its own — otherwise a hand-crafted
+      // request could store a phone number that does not belong to the account,
+      // and the UI would report a connection Meta never confirmed.
       let wabaId = wabaIdFromClient ?? null;
-      let phoneNumberId = phoneIdFromClient ?? null;
+      const wabaListUrl = new URL(
+        'https://graph.facebook.com/v22.0/me/owned_whatsapp_business_accounts',
+      );
+      wabaListUrl.searchParams.set('fields', 'id,name,account_review_status');
+      wabaListUrl.searchParams.set('limit', '100');
+      wabaListUrl.searchParams.set('access_token', businessToken);
+      const wabaRes = await fetch(wabaListUrl.toString());
+      const wabaData = await wabaRes.json();
+      const wabaList: Array<Record<string, unknown>> = Array.isArray(wabaData.data)
+        ? wabaData.data
+        : [];
+
+      if (wabaId) {
+        // The hint must be one this token actually owns.
+        if (!wabaList.some((w) => String(w.id) === wabaId)) {
+          console.warn(
+            '[whatsapp-signup] client hint for the WABA is not owned by this Meta account — resolving server-side instead',
+          );
+          wabaId = null;
+        }
+      } else if (wabaList.length > 0) {
+        wabaId = String(wabaList[0].id);
+      }
 
       if (!wabaId) {
-        const wabaUrl = new URL(
-          'https://graph.facebook.com/v22.0/me/owned_whatsapp_business_accounts',
+        throw new Error(
+          'No WhatsApp Business Account was found for this Meta account. Create one in the Embedded Signup dialog, then retry.',
         );
-        wabaUrl.searchParams.set('fields', 'id,name');
-        wabaUrl.searchParams.set('access_token', businessToken);
-        const wabaRes = await fetch(wabaUrl.toString());
-        const wabaData = await wabaRes.json();
-        const firstWaba = Array.isArray(wabaData.data) ? wabaData.data[0] : null;
-        if (!firstWaba) {
-          throw new Error(
-            'No WhatsApp Business Account was found for this Meta account.',
-          );
-        }
-        wabaId = String(firstWaba.id);
       }
 
-      let displayName: string | null = null;
-      let displayPhone: string | null = null;
-
-      if (!phoneNumberId) {
-        const phoneUrl = new URL(
-          `https://graph.facebook.com/v22.0/${wabaId}/phone_numbers`,
+      // Every phone number registered on this WABA, with its display metadata.
+      const phoneUrl = new URL(
+        `https://graph.facebook.com/v22.0/${wabaId}/phone_numbers`,
+      );
+      phoneUrl.searchParams.set('fields', 'id,display_phone_number,verified_name,quality_rating');
+      phoneUrl.searchParams.set('limit', '100');
+      phoneUrl.searchParams.set('access_token', businessToken);
+      const phoneRes = await fetch(phoneUrl.toString());
+      const phoneData = await phoneRes.json();
+      if (phoneRes.ok === false || phoneData?.error) {
+        throw new Error(
+          `Could not read the phone numbers of this WhatsApp Business Account: ${phoneData?.error?.message ?? phoneRes.status}`,
         );
-        phoneUrl.searchParams.set('fields', 'id,display_phone_number,verified_name');
-        phoneUrl.searchParams.set('access_token', businessToken);
-        const phoneRes = await fetch(phoneUrl.toString());
-        const phoneData = await phoneRes.json();
-        const firstPhone = Array.isArray(phoneData.data) ? phoneData.data[0] : null;
-        if (!firstPhone) {
-          throw new Error('No phone number is registered on this WhatsApp Business Account.');
-        }
-        phoneNumberId = String(firstPhone.id);
-        displayPhone = firstPhone.display_phone_number ?? null;
-        displayName = firstPhone.verified_name ?? null;
-      } else {
-        // Confirm the number details for a better account label.
-        try {
-          const infoUrl = new URL(`https://graph.facebook.com/v22.0/${phoneNumberId}`);
-          infoUrl.searchParams.set('fields', 'display_phone_number,verified_name');
-          infoUrl.searchParams.set('access_token', businessToken);
-          const infoRes = await fetch(infoUrl.toString());
-          const infoData = await infoRes.json();
-          displayPhone = infoData.display_phone_number ?? null;
-          displayName = infoData.verified_name ?? null;
-        } catch {
-          // Non-fatal: the account can still be stored with a generic name.
-        }
       }
+      const phoneList: Array<Record<string, unknown>> = Array.isArray(phoneData.data)
+        ? phoneData.data
+        : [];
+
+      if (phoneList.length === 0) {
+        throw new Error(
+          'No phone number is registered on this WhatsApp Business Account. Add one in the Embedded Signup dialog, then retry.',
+        );
+      }
+
+      // A client hint is honored only when it matches a number on this WABA.
+      const hintedPhone = phoneIdFromClient
+        ? phoneList.find((p) => String(p.id) === phoneIdFromClient)
+        : undefined;
+      const chosenPhone = hintedPhone ?? phoneList[0];
+
+      const phoneNumberId = String(chosenPhone.id);
+      const displayPhone: string | null = (chosenPhone.display_phone_number as string) ?? null;
+      const displayName: string | null = (chosenPhone.verified_name as string) ?? null;
 
       // Step 3 — register the number for Cloud API and subscribe webhooks.
       // Both are best-effort: the business token is already usable to send.
@@ -403,6 +433,16 @@ Deno.serve(async (req: Request) => {
       }
       if (columns.has('account_name')) row.account_name = accountName;
 
+      // WhatsApp-specific identifiers (additive columns, see migration
+      // 20260926000000_social_accounts_whatsapp.sql). These are what let the
+      // UI show the real phone number and the business account name instead of
+      // a raw Phone Number ID, and what makes the row self-describing.
+      if (columns.has('waba_id')) row.waba_id = wabaId;
+      if (columns.has('phone_number')) row.phone_number = displayPhone;
+      if (columns.has('display_name')) row.display_name = displayName;
+      // Reconnecting an account revives a previously soft-disconnected row.
+      if (columns.has('is_active')) row.is_active = true;
+
       if (columns.has('access_token_encrypted')) {
         row.access_token_encrypted = businessToken;
       } else if (columns.has('access_token')) {
@@ -432,12 +472,19 @@ Deno.serve(async (req: Request) => {
         );
       }
 
+      // Only reached once Meta itself confirmed the WABA, the phone number and
+      // the token — so the client can safely say "connected". No token is
+      // returned to the browser.
       return json({
         ok: true,
         account: {
           id: saved?.id ?? null,
           external_account_id: String(phoneNumberId),
           name: accountName,
+          whatsapp_business_id: wabaId,
+          phone_number_id: String(phoneNumberId),
+          display_phone_number: displayPhone,
+          display_name: displayName,
         },
       });
     } catch (e) {

@@ -52,6 +52,20 @@ export interface SocialAccount {
   account_name: string | null;
   /** Aggregate status derived from the row; token columns may not be selected. */
   connected_at?: string | null;
+  /**
+   * Connection state. A disconnected account keeps its row (and therefore all
+   * of its contacts, conversations, messages and CRM history) and is only
+   * marked inactive, so this is the signal the UI uses to show "Not connected".
+   * Optional because the column is an additive migration — before it is applied
+   * every existing row is active by definition.
+   */
+  is_active?: boolean;
+  /** WhatsApp only: the WhatsApp Business Account (WABA) id. */
+  waba_id?: string | null;
+  /** WhatsApp only: the customer-facing business number, display form. */
+  phone_number?: string | null;
+  /** WhatsApp only: the verified business name shown in WhatsApp. */
+  display_name?: string | null;
 }
 
 export interface Message {

@@ -2,16 +2,14 @@ import { supabase } from '@/utils/supabase';
 import { SocialAccount } from '../types';
 import { launchWhatsAppEmbeddedSignup } from './metaSdk';
 
-export interface WhatsAppConnectParams {
-  phoneNumberId: string;
-  accountName: string;
-  accessToken: string;
-}
-
 export interface WhatsAppSignupAccount {
   id: string | null;
   external_account_id: string;
   name: string | null;
+  whatsapp_business_id?: string | null;
+  phone_number_id?: string | null;
+  display_phone_number?: string | null;
+  display_name?: string | null;
 }
 
 interface SignupEdgeResult {
@@ -19,6 +17,10 @@ interface SignupEdgeResult {
   error?: string;
   account?: WhatsAppSignupAccount;
 }
+
+/** Columns safe to read from the browser. The token column is never selected. */
+const ACCOUNT_COLUMNS =
+  'id, organization_id, platform, external_account_id, account_name, is_active, waba_id, phone_number, display_name';
 
 export const whatsappService = {
   /**
@@ -68,21 +70,34 @@ export const whatsappService = {
 
     const account = await this.getConnectedAccount();
     if (!account) {
+      // "Connected" is only reported when the row can actually be read back
+      // under the caller's RLS scope. If the read fails (most often because the
+      // social_accounts migration has not been applied yet, so is_active does
+      // not exist) the real reason is surfaced instead of a false success.
       throw new Error(
-        'WhatsApp was connected but the account could not be read back. Check the Edge Function logs.',
+        'The backend stored the WhatsApp account, but it could not be read back. ' +
+          'Check that the social_accounts WhatsApp migration has been applied to the database.',
       );
     }
     return account;
   },
 
   /**
-   * Fetch connected WhatsApp account for current user
+   * Fetch the connected WhatsApp account for the current user.
+   *
+   * Only ACTIVE accounts count as connected: a disconnected account keeps its
+   * row (and all of its history) but must not be shown as connected.
+   * RLS scopes the result to the caller's organization, and the access token
+   * column is deliberately not selected.
    */
   async getConnectedAccount(): Promise<SocialAccount | null> {
     const { data, error } = await supabase
       .from('social_accounts')
-      .select('id, organization_id, platform, external_account_id, account_name')
+      .select(ACCOUNT_COLUMNS)
       .eq('platform', 'whatsapp')
+      .eq('is_active', true)
+      .order('connected_at', { ascending: false })
+      .limit(1)
       .maybeSingle();
 
     if (error) throw new Error(error.message);
@@ -90,64 +105,18 @@ export const whatsappService = {
   },
 
   /**
-   * Connect / link WhatsApp account by Phone Number ID and Access Token
-   */
-  async connectAccount(params: WhatsAppConnectParams): Promise<SocialAccount> {
-    // 1. Get current user
-    const {
-      data: { user },
-      error: userError,
-    } = await supabase.auth.getUser();
-
-    if (userError || !user) {
-      throw new Error('Not authenticated.');
-    }
-
-    // 2. Resolve organization ID from organization_members
-    const { data: member, error: memberError } = await supabase
-      .from('organization_members')
-      .select('organization_id')
-      .eq('user_id', user.id)
-      .limit(1)
-      .maybeSingle();
-
-    if (memberError || !member?.organization_id) {
-      throw new Error('No organization found for this user.');
-    }
-
-    const organizationId = member.organization_id;
-
-    // 3. Upsert into social_accounts
-    const payload: Record<string, unknown> = {
-      organization_id: organizationId,
-      platform: 'whatsapp',
-      external_account_id: params.phoneNumberId.trim(),
-      account_name: params.accountName.trim() || 'WhatsApp Business',
-      access_token: params.accessToken.trim(),
-    };
-
-    const { data, error } = await supabase
-      .from('social_accounts')
-      .upsert(payload, {
-        onConflict: 'organization_id,platform,external_account_id',
-      })
-      .select('id, organization_id, platform, external_account_id, account_name')
-      .single();
-
-    if (error) {
-      throw new Error(error.message);
-    }
-
-    return data as SocialAccount;
-  },
-
-  /**
-   * Disconnect WhatsApp account
+   * Disconnect WhatsApp — a SOFT disconnect, never a delete.
+   *
+   * `conversations.social_account_id` references this row, so deleting it could
+   * cascade onto conversations and their messages and destroy the historical
+   * CRM data. Marking the account inactive stops new inbound attribution while
+   * contacts, conversations, messages and every AI-extracted CRM field remain
+   * exactly as they are. Reconnecting flips the flag back on.
    */
   async disconnect(accountId: string): Promise<void> {
     const { error } = await supabase
       .from('social_accounts')
-      .delete()
+      .update({ is_active: false })
       .eq('id', accountId)
       .eq('platform', 'whatsapp');
 

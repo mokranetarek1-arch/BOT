@@ -1,152 +1,164 @@
-import { useState, useEffect } from 'react';
-import { SocialAccount } from '../../../types';
-import { whatsappService } from '../../../services/whatsappService';
+import { useEffect, useState } from 'react';
+import { whatsappService } from '@/services/whatsappService';
+import { SocialAccount } from '@/types';
+import { Button } from '@/components/ui/button';
+
+/**
+ * The full UI state machine required of every channel card:
+ *   loading -> not_connected -> connecting -> connected
+ *   connected -> disconnecting -> disconnected
+ *   any state -> error (showing the REAL backend error, never a fake success)
+ */
+type Phase =
+  | 'loading'
+  | 'not_connected'
+  | 'connecting'
+  | 'connected'
+  | 'disconnecting'
+  | 'disconnected'
+  | 'error';
 
 export function WhatsAppConnect() {
   const [account, setAccount] = useState<SocialAccount | null>(null);
-  const [loading, setLoading] = useState(true);
-  const [saving, setSaving] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const [success, setSuccess] = useState<string | null>(null);
-  const [isModalOpen, setIsModalOpen] = useState(false);
-
-  const [phoneNumberId, setPhoneNumberId] = useState('');
-  const [accountName, setAccountName] = useState('');
-  const [accessToken, setAccessToken] = useState('');
+  const [phase, setPhase] = useState<Phase>('loading');
+  const [message, setMessage] = useState<string | null>(null);
 
   useEffect(() => {
+    let cancelled = false;
     whatsappService
       .getConnectedAccount()
-      .then(setAccount)
-      .catch((err) => console.warn('WA load error:', err))
-      .finally(() => setLoading(false));
+      .then((existing) => {
+        if (cancelled) return;
+        setAccount(existing);
+        setPhase(existing ? 'connected' : 'not_connected');
+      })
+      .catch((err: unknown) => {
+        if (cancelled) return;
+        // A read failure is a real problem: surface it rather than pretending
+        // the channel is simply not connected.
+        setPhase('error');
+        setMessage(
+          err instanceof Error
+            ? err.message
+            : 'Could not read the WhatsApp connection status.',
+        );
+      });
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
-  const handleConnect = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!phoneNumberId.trim() || !accessToken.trim()) {
-      setError('Phone Number ID and Access Token are required.');
-      return;
-    }
-    setSaving(true);
-    setError(null);
-    try {
-      const saved = await whatsappService.connectAccount({
-        phoneNumberId: phoneNumberId.trim(),
-        accountName: accountName.trim() || 'WhatsApp Business',
-        accessToken: accessToken.trim(),
-      });
-      setAccount(saved);
-      setSuccess('WhatsApp connected successfully!');
-      setIsModalOpen(false);
-      setPhoneNumberId('');
-      setAccessToken('');
-    } catch (err: unknown) {
-      setError(err instanceof Error ? err.message : 'Failed to connect WhatsApp.');
-    } finally {
-      setSaving(false);
-    }
-  };
-
   /**
-   * One-click connect via Meta Embedded Signup: the user never types a
-   * Phone Number ID or an Access Token — Meta hands them to us directly.
+   * Meta Embedded Signup. The user picks or creates a WhatsApp Business Account
+   * and a phone number inside Meta's own dialog; we only forward the short-lived
+   * code to the Edge Function, which performs the token exchange and stores the
+   * account. No access token is ever held in the browser.
    */
-  const handleMetaSignup = async () => {
-    setSaving(true);
-    setError(null);
-    setSuccess(null);
+  const handleConnect = async () => {
+    setPhase('connecting');
+    setMessage('Complete the Meta sign-up dialog…');
     try {
       const saved = await whatsappService.connectWithEmbeddedSignup();
       setAccount(saved);
-      setSuccess(`WhatsApp connected: ${saved.account_name ?? saved.external_account_id}`);
+      setPhase('connected');
+      setMessage(null);
     } catch (err: unknown) {
-      // A plain dismissal of the Meta dialog must not look like a failure.
-      const message = err instanceof Error ? err.message : 'Failed to connect WhatsApp.';
-      if (message.toLowerCase().includes('cancelled')) return;
-      setError(message);
-    } finally {
-      setSaving(false);
+      const text =
+        err instanceof Error ? err.message : 'WhatsApp could not be connected.';
+      // Closing the Meta dialog without finishing is a cancellation, not a failure.
+      if (text.toLowerCase().includes('cancelled')) {
+        setPhase(account ? 'connected' : 'not_connected');
+        setMessage(null);
+        return;
+      }
+      setPhase('error');
+      setMessage(text);
     }
   };
 
   const handleDisconnect = async () => {
     if (!account) return;
-    setSaving(true);
-    setError(null);
+    setPhase('disconnecting');
+    setMessage(null);
     try {
+      // Soft disconnect: contacts, conversations, messages and CRM history stay.
       await whatsappService.disconnect(account.id);
       setAccount(null);
-      setSuccess('WhatsApp disconnected.');
+      setPhase('disconnected');
     } catch (err: unknown) {
-      setError(err instanceof Error ? err.message : 'Failed to disconnect WhatsApp.');
-    } finally {
-      setSaving(false);
+      setPhase('error');
+      setMessage(
+        err instanceof Error ? err.message : 'Could not disconnect WhatsApp.',
+      );
     }
   };
 
+  const isBusy =
+    phase === 'loading' || phase === 'connecting' || phase === 'disconnecting';
+  const isDisconnecting = phase === 'disconnecting';
+  const isConnected = phase === 'connected';
+  const phone = account?.phone_number ?? null;
+  const businessName = account?.display_name ?? account?.account_name ?? null;
+
   return (
-    <div className="space-y-4">
-      <div className="flex items-center justify-between p-4 border rounded-lg">
+    <div className="flex flex-col gap-2 p-4 border rounded-lg bg-card">
+      <div className="flex items-center justify-between">
         <div className="flex items-center gap-3">
-          <div className="w-10 h-10 bg-green-100 text-green-600 rounded-md flex items-center justify-center font-bold">WA</div>
+          <div className="w-10 h-10 bg-green-100 dark:bg-green-950/40 text-green-600 rounded-md flex items-center justify-center font-bold">
+            WA
+          </div>
           <div>
-            <p className="font-medium">WhatsApp Business (Cloud API)</p>
-            {loading ? (
-              <p className="text-sm text-muted-foreground">Checking...</p>
-            ) : account ? (
-              <p className="text-sm text-green-600 font-medium">Connected: {account.account_name ?? 'WhatsApp'} (ID: {account.external_account_id})</p>
-            ) : (
-              <p className="text-sm text-muted-foreground">Not connected</p>
+            <div className="flex items-center gap-2">
+              <p className="font-medium">WhatsApp Business</p>
+              {isConnected && (
+                <span className="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium bg-green-100 text-green-800 dark:bg-green-950/50 dark:text-green-300">
+                  Connected
+                </span>
+              )}
+            </div>
+            <p className="text-sm text-muted-foreground">
+              {phase === 'loading'
+                ? 'Checking…'
+                : isConnected
+                  ? (phone ?? account?.account_name ?? 'WhatsApp Business')
+                  : 'Connect your WhatsApp Business number to chat with customers.'}
+            </p>
+            {isConnected && businessName && (
+              <p className="text-xs text-muted-foreground">
+                Business Account: {businessName}
+              </p>
             )}
           </div>
         </div>
-        <div className="flex items-center gap-2">
-          {account ? (
-            <button onClick={handleDisconnect} disabled={saving} className="h-9 px-4 rounded-md border border-red-200 text-red-600 hover:bg-red-50 text-sm font-medium disabled:opacity-50">
-              {saving ? 'Disconnecting...' : 'Disconnect'}
-            </button>
-          ) : (
-            <>
-              <button onClick={handleMetaSignup} disabled={saving} className="h-9 px-4 rounded-md bg-green-600 hover:bg-green-700 text-white text-sm font-medium shadow-sm transition-colors disabled:opacity-50">
-                {saving ? 'Connecting...' : 'Connect with Meta'}
-              </button>
-              <button onClick={() => setIsModalOpen(true)} className="h-9 px-3 rounded-md border text-sm font-medium hover:bg-accent">
-                Manual
-              </button>
-            </>
-          )}
-        </div>
-      </div>
-      {error && <div className="p-3 text-sm text-red-600 bg-red-50 border border-red-200 rounded-md">{error}</div>}
-      {success && <div className="p-3 text-sm text-green-600 bg-green-50 border border-green-200 rounded-md">{success}</div>}
 
-      {isModalOpen && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4">
-          <div className="bg-background border rounded-xl shadow-lg max-w-md w-full p-6 space-y-4">
-            <h3 className="text-lg font-semibold">Connect WhatsApp Business</h3>
-            <form onSubmit={handleConnect} className="space-y-4">
-              <div>
-                <label className="block text-sm font-medium mb-1">Account Name</label>
-                <input type="text" value={accountName} onChange={(e) => setAccountName(e.target.value)} placeholder="WhatsApp Pro" className="w-full h-9 px-3 border rounded-md text-sm bg-background" />
-              </div>
-              <div>
-                <label className="block text-sm font-medium mb-1">Phone Number ID *</label>
-                <input type="text" required value={phoneNumberId} onChange={(e) => setPhoneNumberId(e.target.value)} placeholder="e.g. 5521998..." className="w-full h-9 px-3 border rounded-md text-sm bg-background" />
-              </div>
-              <div>
-                <label className="block text-sm font-medium mb-1">Access Token *</label>
-                <input type="password" required value={accessToken} onChange={(e) => setAccessToken(e.target.value)} placeholder="EAAB..." className="w-full h-9 px-3 border rounded-md text-sm bg-background" />
-              </div>
-              <div className="flex justify-end gap-2 pt-2">
-                <button type="button" onClick={() => setIsModalOpen(false)} className="h-9 px-4 rounded-md border text-sm font-medium hover:bg-accent">Cancel</button>
-                <button type="submit" disabled={saving} className="h-9 px-4 rounded-md bg-primary text-primary-foreground text-sm font-medium hover:bg-primary/90 disabled:opacity-50">
-                  {saving ? 'Connecting...' : 'Save & Connect'}
-                </button>
-              </div>
-            </form>
-          </div>
-        </div>
+        {isConnected ? (
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={handleDisconnect}
+            disabled={isBusy}
+          >
+            {isDisconnecting ? 'Disconnecting…' : 'Disconnect'}
+          </Button>
+        ) : (
+          <Button size="sm" onClick={handleConnect} disabled={isBusy}>
+            {phase === 'connecting'
+              ? 'Connecting…'
+              : phase === 'disconnected'
+                ? 'Reconnect'
+                : 'Connect'}
+          </Button>
+        )}
+      </div>
+
+      {message && phase !== 'loading' && (
+        <p
+          className={`text-xs mt-1 ${
+            phase === 'error' ? 'text-destructive' : 'text-muted-foreground'
+          }`}
+        >
+          {message}
+        </p>
       )}
     </div>
   );
