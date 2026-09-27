@@ -342,38 +342,66 @@ async function getMessageColumns(
   return existing;
 }
 
+/** Technical placeholder names created by this worker: "<channel> user <id>". */
+function isPlaceholderName(name: string | null | undefined): boolean {
+  const value = (name ?? '').trim().toLowerCase();
+  if (!value) return true;
+  if (value === 'unknown' || value === 'unknown contact') return true;
+  return /^(instagram|facebook|whatsapp) user /i.test(name ?? '');
+}
+
 /**
- * Best-effort contact identity enrichment (Phase 1.5).
+ * The customer's display name as provided by the platform itself, when the
+ * payload carries one. WhatsApp does (`contacts[].profile.name`); Instagram DMs
+ * and Messenger do not and need an API lookup instead.
+ */
+function payloadProvidedName(event: NormalizedEvent): string {
+  const raw = event.profile_data?.['name'];
+  return typeof raw === 'string' ? raw.trim() : '';
+}
+
+/**
+ * Best-effort contact identity enrichment.
  *
- * Instagram DM webhooks carry ONLY identifiers (IGSIDs) — no username or
- * display name. The sender's username can be obtained officially from the
- * Message Details API using the message ID and the receiving account's
- * stored Instagram User access token:
- *   GET https://graph.instagram.com/v25.0/<MESSAGE_ID>
- *       ?fields=id,created_time,from,to,message
+ * Instagram and Messenger webhooks carry only technical identifiers — an IGSID
+ * for Instagram, a PSID for Messenger — and no name. Each platform exposes the
+ * person's identity through a DIFFERENT API, so `params.channel` decides:
+ *
+ *   Instagram (IGSID)
+ *     GET https://graph.instagram.com/v25.0/<MESSAGE_ID>
+ *         ?fields=id,created_time,from,to,message        -> from.username
+ *
+ *   Messenger (PSID)
+ *     GET https://graph.facebook.com/v22.0/<PSID>
+ *         ?fields=name,first_name,last_name              -> name
+ *
+ * Messenger has no username concept at all, so sending its message id to the
+ * Instagram endpoint can only ever fail — that is why the channel must dispatch.
  *
  * Rules:
  *  - Runs ONLY for placeholder-named contacts ("instagram user 123456" /
- *    empty / unknown) so the API is NOT called for every message.
+ *    "facebook user 123456" / "whatsapp user 123456" / empty / unknown) so the
+ *    API is NOT called for every message.
  *  - Never throws and never alters the ingestion outcome: on any failure the
  *    placeholder name is kept and a warning is logged.
  *  - The access token is read from social_accounts (service role) and is
  *    NEVER logged.
+ *  - WhatsApp normally needs no API call here: its payload already carries
+ *    contacts[].profile.name, which ingestion applies directly.
  */
 async function enrichContactUsername(
   supabase: ReturnType<typeof createClient>,
-  params: { socialAccountId: string; contactChannelId: string; messageId: string },
+  params: {
+    socialAccountId: string;
+    contactChannelId: string;
+    messageId: string;
+    /** Dispatches to the right platform API — the two are not interchangeable. */
+    channel: string;
+  },
 ): Promise<void> {
-  const isPlaceholderName = (name: string | null | undefined): boolean => {
-    const value = (name ?? '').trim().toLowerCase();
-    if (!value) return true;
-    if (value === 'unknown' || value === 'unknown contact') return true;
-    // Names created by this worker: "<channel> user <last-6-of-IGSID>"
-    return /^(instagram|facebook) user /i.test(name ?? '');
-  };
-
   try {
-    // 1. The receiving account's stored Instagram User access token.
+    // 1. The receiving account's stored access token: an Instagram User token
+    //    for Instagram, the Facebook Page token for Messenger.
     const { data: socialAccount, error: saError } = await supabase
       .from('social_accounts')
       .select('access_token')
@@ -397,7 +425,7 @@ async function enrichContactUsername(
     //    what keeps the Message Details API from being called per message.
     const { data: channel } = await supabase
       .from('contact_channels')
-      .select('contact_id, profile_data')
+      .select('contact_id, profile_data, external_user_id')
       .eq('id', params.contactChannelId)
       .maybeSingle();
     const channelProfile = channel?.profile_data as Record<string, unknown> | null;
@@ -405,8 +433,8 @@ async function enrichContactUsername(
       console.warn('CONTACT_ENRICH_SKIPPED: contact_channel not found');
       return;
     }
-    if (channelProfile?.['username']) {
-      return; // username already known from a previous message
+    if (channelProfile?.['username'] || channelProfile?.['name']) {
+      return; // identity already resolved on a previous message
     }
 
     const { data: contact } = await supabase
@@ -422,55 +450,153 @@ async function enrichContactUsername(
       return; // a real name is already present
     }
 
-    // 3. Message Details API — the official, documented username source.
-    const detailsUrl = new URL(
-      `https://graph.instagram.com/v25.0/${encodeURIComponent(params.messageId)}`,
-    );
-    detailsUrl.searchParams.set('fields', 'id,created_time,from,to,message');
-    detailsUrl.searchParams.set('access_token', accessToken);
+    // 3. Resolve the person's real name from the platform's own API.
+    //
+    // Instagram and Facebook are NOT interchangeable here:
+    //  - an Instagram DM is identified by an IGSID and exposes a `username`
+    //    through the Message Details API (graph.instagram.com);
+    //  - a Messenger identity is a PSID and has NO username concept at all —
+    //    the name comes from the Graph profile endpoint, read with the PAGE
+    //    token.
+    // Sending a Messenger mid to the Instagram endpoint can only ever fail,
+    // which is why the channel decides here.
+    //
+    // Best-effort: on any failure the placeholder name is kept.
+    const resolvedName =
+      params.channel === 'facebook'
+        ? await fetchFacebookDisplayName(
+            accessToken,
+            String(channel.external_user_id ?? ''),
+          )
+        : await fetchInstagramUsername(accessToken, params.messageId);
 
-    const res = await fetch(detailsUrl.toString());
-    const details = await res.json();
-    if (!res.ok || details?.error) {
-      console.warn(
-        `CONTACT_ENRICH_FAILED: message details request failed (${details?.error?.message ?? res.status})`,
-      );
-      return;
+    if (!resolvedName) {
+      return; // the helper already logged the reason
     }
 
-    const detailsPayload = Array.isArray(details?.data) ? details.data[0] : details;
-    const username = detailsPayload?.from?.username as string | undefined;
-    if (!username) {
-      console.warn('CONTACT_ENRICH_FAILED: no username in message details response');
-      return;
-    }
-
-    // 4. Persist the Meta-trusted username. contacts.name is updated only
-    //    while it is still a placeholder; existing real names are never
+    // 4. Persist the platform-trusted identity. contacts.name is updated only
+    //    while it is still a placeholder; an existing real name is never
     //    overwritten.
     if (isPlaceholderName(contact.name as string | undefined)) {
       await supabase
         .from('contacts')
-        .update({ name: username })
+        .update({ name: resolvedName })
         .eq('id', contact.id);
     }
 
     const mergedProfile = {
       ...((channelProfile ?? {}) as Record<string, unknown>),
-      username,
+      ...(params.channel === 'instagram'
+        ? { username: resolvedName }
+        : { name: resolvedName }),
     };
+
+    // `contact_channels.username` is the column the CRM renders as "@handle".
+    // Messenger has no handle concept, so it is only written for Instagram.
+    const channelPatch: Record<string, unknown> = { profile_data: mergedProfile };
+    if (params.channel === 'instagram') {
+      channelPatch.username = resolvedName;
+    }
+
     await supabase
       .from('contact_channels')
-      .update({ profile_data: mergedProfile })
+      .update(channelPatch)
       .eq('id', params.contactChannelId);
 
-    console.log(`CONTACT_ENRICHED: contact=${contact.id} username=${username}`);
+    console.log(
+      `CONTACT_ENRICHED: contact=${contact.id} channel=${params.channel} name=${resolvedName}`,
+    );
   } catch (e) {
     console.warn(
       'CONTACT_ENRICH_FAILED:',
       e instanceof Error ? e.message : String(e),
     );
   }
+}
+
+/**
+ * The sender's Instagram username, via the official Message Details API.
+ *
+ * Instagram DMs only carry an IGSID in the webhook, so the username can only
+ * come from this documented endpoint. Returns null (after logging) when Meta
+ * does not provide one; the caller then keeps the placeholder name.
+ */
+async function fetchInstagramUsername(
+  accessToken: string,
+  messageId: string,
+): Promise<string | null> {
+  const url = new URL(
+    `https://graph.instagram.com/v25.0/${encodeURIComponent(messageId)}`,
+  );
+  url.searchParams.set('fields', 'id,created_time,from,to,message');
+  url.searchParams.set('access_token', accessToken);
+
+  const res = await fetch(url.toString());
+  const details = await res.json();
+  if (!res.ok || details?.error) {
+    console.warn(
+      `CONTACT_ENRICH_FAILED: instagram message details request failed (${details?.error?.message ?? res.status})`,
+    );
+    return null;
+  }
+
+  const payload = Array.isArray(details?.data) ? details.data[0] : details;
+  const username = (payload?.from?.username as string | undefined)?.trim();
+  if (!username) {
+    console.warn('CONTACT_ENRICH_FAILED: no username in message details response');
+    return null;
+  }
+  return username;
+}
+
+/**
+ * The sender's Messenger display name, resolved per PSID.
+ *
+ * Messenger has no username concept: the webhook carries only a page-scoped id,
+ * so the person's name can only come from the Graph profile endpoint read with
+ * the PAGE access token.
+ *
+ * Meta restricts this lookup (the User Profile API needs the relevant messaging
+ * permission and a real interaction), so a failure here is expected and
+ * non-fatal — null is returned and the placeholder name is kept.
+ */
+async function fetchFacebookDisplayName(
+  accessToken: string,
+  psid: string,
+): Promise<string | null> {
+  if (!psid) {
+    console.warn('CONTACT_ENRICH_FAILED: no PSID stored for this Facebook channel');
+    return null;
+  }
+
+  const url = new URL(
+    `https://graph.facebook.com/v22.0/${encodeURIComponent(psid)}`,
+  );
+  url.searchParams.set('fields', 'name,first_name,last_name');
+  url.searchParams.set('access_token', accessToken);
+
+  const res = await fetch(url.toString());
+  const profile = await res.json();
+  if (!res.ok || profile?.error) {
+    console.warn(
+      `CONTACT_ENRICH_FAILED: facebook profile request failed (${profile?.error?.message ?? res.status})`,
+    );
+    return null;
+  }
+
+  const full = typeof profile?.name === 'string' ? profile.name.trim() : '';
+  if (full) return full;
+
+  // Some accounts expose only the split fields.
+  const combined = [profile?.first_name, profile?.last_name]
+    .filter((part): part is string => typeof part === 'string' && part.trim().length > 0)
+    .join(' ')
+    .trim();
+  if (!combined) {
+    console.warn('CONTACT_ENRICH_FAILED: no name in facebook profile response');
+    return null;
+  }
+  return combined;
 }
 
 // ---------------------------------------------------------------------------
@@ -608,18 +734,41 @@ async function persistEvent(
   if (existingChannel) {
     contactChannelId = existingChannel.id;
     console.log(`CONTACT_FOUND_OR_CREATED: found contact_channel=${contactChannelId}`);
+
+    // Some platforms ship the customer's display name in the payload itself
+    // (WhatsApp sends `contacts[].profile.name`). Adopt it only while the stored
+    // name is still a technical placeholder — a real name is never overwritten.
+    const providedName = payloadProvidedName(event);
+    if (providedName) {
+      const { data: existingContact } = await supabase
+        .from('contacts')
+        .select('id, name')
+        .eq('id', existingChannel.contact_id)
+        .maybeSingle();
+      if (isPlaceholderName(existingContact?.name as string | undefined)) {
+        await supabase
+          .from('contacts')
+          .update({ name: providedName })
+          .eq('id', existingChannel.contact_id);
+        console.log(
+          `CONTACT_NAMED_FROM_PAYLOAD: contact=${existingChannel.contact_id} name="${providedName}"`,
+        );
+      }
+    }
   } else {
-    // Create a contact first, then a contact_channel record
+    // The payload's own display name when the platform provides one (WhatsApp
+    // sends `contacts[].profile.name`); otherwise a technical placeholder that
+    // the enrichment step can replace later. Instagram and Messenger never send
+    // a name in the webhook, which is exactly why the placeholder exists.
+    const payloadName = payloadProvidedName(event);
     const { data: newContact, error: contactError } = await supabase
       .from('contacts')
       .insert({
         organization_id: resolvedOrgId,
-        // Name will be updated later if profile data becomes available
-        name: `${event.channel} user ${event.external_user_id.slice(-6)}`,
+        name: payloadName || `${event.channel} user ${event.external_user_id.slice(-6)}`,
         // Provenance of the contact: the channel its first message arrived on.
-        // For Instagram DMs event.channel is exactly 'instagram' (set by the
-        // parser) — no inference, no AI. Only written on creation, never on an
-        // existing contact.
+        // No inference, no AI. Only written on creation, never on an existing
+        // contact.
         source: event.channel,
       })
       .select('id')
@@ -758,6 +907,7 @@ async function persistEvent(
     socialAccountId,
     contactChannelId,
     messageId: event.external_message_id,
+    channel: event.channel,
   });
 
   // 7. Fire-and-forget: automatic AI CRM field extraction on every inbound
